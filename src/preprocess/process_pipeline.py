@@ -84,7 +84,7 @@ def fetch_from_api(symbol, timeframe, start_unix, end_unix, max_candles):
     """Descarga velas desde la API de Capital.com en el rango unix dado."""
     security_token, cst = sesion_capitalcom()
     tf_seconds = TIMEFRAME_SECONDS.get(timeframe, 60)
-    intervalos = date_ranges(start_unix, end_unix, time=tf_seconds, values=max_candles)
+    intervalos = date_ranges(start_unix, end_unix, time=tf_seconds)
 
     dataframe = []
     for from_, to_ in intervalos:
