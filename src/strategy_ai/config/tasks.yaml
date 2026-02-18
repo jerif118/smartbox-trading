@@ -1,0 +1,129 @@
+preparar_data:
+  description: >
+    Recibir y analizar los datos pre-procesados del pipeline, que incluyen
+    para cada símbolo con breakout confirmado:
+    - Caja (box_high / box_low / box_mid / amplitud %)
+    - Señal de breakout 5 min (ABOVE o BELOW + precio de cierre + timestamp)
+    - Volume Profile (POC, HVA, LVA, peaks)
+    - RSI (último valor + puntos pivote para divergencias)
+
+    Tu trabajo:
+    1. Verificar consistencia de los datos recibidos.
+    2. Consultar el calendario macro del día en tus fuentes asignadas.
+    3. Identificar eventos de alto impacto que coincidan con la ventana
+       de operación (30 min antes / 15 min después del breakout).
+    4. Consolidar un resumen operativo para los siguientes pasos.
+
+    Los datos vienen en: {symbols_data}
+  expected_output: >
+    Resumen operativo por símbolo (JSON):
+    {
+      "symbol": "<str>",
+      "breakout": { "state": "ABOVE|BELOW", "close": <float>, "time": "<iso>" },
+      "macro_risk": "LOW|MEDIUM|HIGH",
+      "macro_events": [
+        { "event": "...", "impact": "HIGH|MEDIUM|LOW", "time": "..." }
+      ],
+      "data_quality": { "ok": true/false, "notes": ["..."] }
+    }
+  agent: macro_news_watcher
+
+reglas_trader:
+  description: >
+    Aplicar reglas obligatorias (hard rules) sobre los datos ya procesados:
+
+    (1) Confirmación del breakout:
+        - El breakout ya fue detectado por el monitor (breakout_signal).
+        - breakout_state = ABOVE  →  la dirección sugerida es LONG.
+        - breakout_state = BELOW  →  la dirección sugerida es SHORT.
+
+    (2) Confluencia con Volume Profile:
+        - Si breakout ABOVE pero POC / HVA está justo encima del box_high
+          → resistencia inmediata, precaución.
+        - Si breakout BELOW pero POC / LVA está justo debajo del box_low
+          → soporte inmediato, precaución.
+
+    (3) RSI extremos:
+        - RSI > 80 y breakout ABOVE → sobrecompra, posible trampa alcista → NO_OPERAR.
+        - RSI < 20 y breakout BELOW → sobreventa, posible trampa bajista → NO_OPERAR.
+
+    (4) Macro risk (del paso anterior):
+        - Si macro_risk = HIGH y hay evento alto impacto en los próximos 30 min → NO_OPERAR.
+  expected_output: >
+    hard_rules por símbolo (JSON):
+    {
+      "symbol": "<str>",
+      "passed": true/false,
+      "suggested_direction": "LONG|SHORT",
+      "blocks": ["BREAKOUT_WEAK", "RSI_EXTREME", "VP_RESISTANCE", "MACRO_RISK"],
+      "notes": ["..."]
+    }
+  agent: professional_trader
+
+filtros_risk:
+  description: >
+    Aplicar filtros de ajuste de riesgo (soft rules):
+    - Divergencia precio-RSI contraria al breakout → risk = MEDIO.
+    - POC muy cercano al precio de entrada → risk = MEDIO.
+    - Amplitud de caja < 0.3 % (poco movimiento) → risk = MEDIO.
+    - Múltiples peaks de VP en la zona de entrada → precaución.
+    Si no hay flags negativos → risk = COMPLETO.
+  expected_output: >
+    soft_rules por símbolo (JSON):
+    {
+      "symbol": "<str>",
+      "risk_mode": "COMPLETO|MEDIO",
+      "cautions": ["..."],
+      "notes": ["..."]
+    }
+  agent: professional_trader
+
+decision:
+  description: >
+    Emitir decisión final por cada símbolo basada en
+    datos + hard_rules + soft_rules + breakout_signal.
+
+    Reglas:
+    - Si hard_rules.passed = false  →  action = NO_OPERAR.
+    - Si hard_rules.passed = true:
+        * breakout_state = ABOVE  →  action = LONG  con risk = soft_rules.risk_mode.
+        * breakout_state = BELOW  →  action = SHORT con risk = soft_rules.risk_mode.
+    - confidence: 0-100 basado en confluencia de señales.
+    - reasons: lista con cada razón que justifica la decisión.
+    - key_levels: box_high, box_low, box_mid, poc, hva, lva, peaks.
+    - signal: el breakout_state original y candle_close.
+    - symbol: el símbolo EXACTO para ejecutar la orden.
+
+    IMPORTANTE: La salida DEBE ser un JSON válido con la estructura exacta
+    indicada. Cada símbolo analizado produce una entrada en "decisions".
+  expected_output: >
+    {
+      "decisions": [
+        {
+          "symbol": "<str>",
+          "action": "LONG|SHORT|NO_OPERAR",
+          "risk": "COMPLETO|MEDIO",
+          "confidence": 0-100,
+          "reasons": ["razón 1", "razón 2"],
+          "timing": {
+            "box_end_time": "<iso8601|null>",
+            "trade_valid_until": "<iso8601|null>",
+            "signal_time": "<iso8601|null>"
+          },
+          "key_levels": {
+            "box_high": <float>,
+            "box_low": <float>,
+            "box_mid": <float>,
+            "poc": <float|null>,
+            "hva": <float|null>,
+            "lva": <float|null>,
+            "peaks": [<float>, ...]
+          },
+          "signal": {
+            "breakout_state": "ABOVE|BELOW|INSIDE|NONE",
+            "candle_close": <float|null>
+          }
+        }
+      ]
+    }
+  agent: professional_trader
