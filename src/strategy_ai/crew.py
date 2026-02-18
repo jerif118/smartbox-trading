@@ -3,6 +3,7 @@ import json
 from enum import Enum
 from crewai import Agent, Crew, Process, Task
 from crewai.project import CrewBase, agent, crew, task, before_kickoff, after_kickoff
+from crewai.agents.agent_builder.base_agent import BaseAgent
 from typing import List, Optional
 from pydantic import BaseModel, Field
 from broker_api.login import sesion_simple
@@ -46,9 +47,9 @@ class TimingInfo(BaseModel):
 
 
 class KeyLevels(BaseModel):
-    box_high: float = Field(..., description="Parte superior de la caja")
-    box_low: float = Field(..., description="Parte inferior de la caja")
-    box_mid: float = Field(..., description="Punto medio de la caja")
+    box_high: Optional[float] = Field(None, description="Parte superior de la caja")
+    box_low: Optional[float]  = Field(None, description="Parte inferior de la caja")
+    box_mid: Optional[float]  = Field(None, description="Punto medio de la caja")
     poc: Optional[float] = Field(None, description="Point of Control del Volume Profile")
     hva: Optional[float] = Field(None, description="High Value Area del VP")
     lva: Optional[float] = Field(None, description="Low Value Area del VP")
@@ -83,9 +84,10 @@ class CrewDecisionOutput(BaseModel):
 @CrewBase
 class StrategyAi():
     """StrategyAi crew"""
-
-    agents_config = 'config/agents.yaml'
-    tasks_config = 'config/tasks.yaml'
+    agents: List[BaseAgent]
+    tasks: List[Task]
+    #agents_config = 'agents/strategy_ai/src/strategy_ai/config/agents.yaml'
+    #tasks_config = 'agents/strategy_ai/src/strategy_ai/config/tasks.yaml'
 
     # ── BEFORE KICKOFF: recibir datos ya procesados desde main.py ────
     @before_kickoff
@@ -107,7 +109,7 @@ class StrategyAi():
     # ── AFTER KICKOFF: ejecutar órdenes en SimpleFX ───────────────────
     @after_kickoff
     def ejecutar_ordenes(self, results):
-        
+
         # ── Parsear salida Pydantic ───────────────────────────────────
         decision_output = None
 
@@ -216,7 +218,7 @@ class StrategyAi():
 
     # ── Agents ────────────────────────────────────────────────────────
     @agent
-    def profesional_trader(self) -> Agent:
+    def professional_trader(self) -> Agent:
         return Agent(
             config=self.agents_config['professional_trader'],  # type: ignore[index]
             verbose=True,

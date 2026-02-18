@@ -98,6 +98,7 @@ def fetch_from_api(symbol, timeframe, start_unix, end_unix, max_candles):
         return pd.DataFrame()
 
     df = pd.concat(valid, ignore_index=True)
+    #print('no estandar',df)
     df_norm = standar_data(df)
     return df_norm.drop_duplicates(subset=["time"]).sort_values("time").reset_index(drop=True)
 
@@ -342,6 +343,7 @@ def preprocess_data(
 
     # Box desde datos del parquet (Capital.com)
     high_price, low_price, amplitud = box_strategy(df_unico, box_from, box_to)
+    #print('capital_box', high_price,low_price, amplitud)
 
     if amplitud is not None and amplitud > 1:
         log.warning("[box] %s: amplitud=%.2f%% > 1%% -> operativa nula", symbol, amplitud)

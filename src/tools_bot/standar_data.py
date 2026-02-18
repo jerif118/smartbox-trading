@@ -11,8 +11,13 @@ def standar_data(df):
     df["close"] = df["close"].apply(lambda d: (d['bid'] + d['ask'])/2)
     df["high"] = df["high"].apply(lambda d: (d['bid'] + d['ask'])/2)
     df["low"] = df["low"].apply(lambda d: (d['bid'] + d['ask'])/2)
-    t = pd.to_datetime(df['time'], utc= True)      
+    t = pd.to_datetime(df['time'], utc= True)
+    t = t.dt.tz_localize(None)
+    t = t.astype('datetime64[ns]')
     df['time'] = (t.astype('int64')//10**9).astype('int64')
+    if 'snapshotTime' in df.columns:
+        df = df.drop(columns=['snapshotTime'])
+    #print("standar_data",df)
     return df
 
 
