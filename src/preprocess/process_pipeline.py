@@ -111,7 +111,7 @@ def merge_and_deduplicate(old_df: pd.DataFrame | None, new_df: pd.DataFrame) -> 
     return combined.drop_duplicates(subset=["time"]).sort_values("time").reset_index(drop=True)
 
 
-def load_or_fetch_vp(symbol: str, start_unix: int, end_unix: int, max_candles: int = 1000) -> pd.DataFrame:
+def load_or_fetch_vp(symbol: str, start_unix: int, end_unix: int, max_candles: int = 500) -> pd.DataFrame:
     """
     Carga o descarga datos de 1 minuto exclusivos para Volume Profile.
     Usa su propio parquet en VP_LOADER_PATH con el mismo flujo de caché
