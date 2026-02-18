@@ -16,16 +16,16 @@ def orden_pending(
 ):
     url = f"{URL}/api/v3/trading/orders/pending"
     headers = {"Authorization": f"Bearer {token}"}
-    request_id = str(uuid.uuid4())
+    #request_id = str(uuid.uuid4())
     body = {
         "ActivationPrice": entry_price,
         "Symbol": symbol,
         "Volume": volumen,
         "StopLoss": stop_price,
-        "Side": side,
-        "RequestId": request_id,
-        "Login": account,
-        "Reality": reality,
+        "Side": side.upper(),
+        #"RequestId": request_id,
+        "Login": int(account),
+        "Reality": reality.upper(),
     }
     if takeprofit_price is not None:
         body["TakeProfit"] = takeprofit_price
@@ -33,11 +33,12 @@ def orden_pending(
         body["ExpiryTime"] = expirytime
 
     log.info(
-        "Enviando orden %s %s %.2f vol @ %.2f | SL=%.2f | TP=%s | reqId=%s",
-        side, symbol, volumen, entry_price, stop_price,
-        takeprofit_price, request_id,
+        "Enviando orden %s %s %.2f vol @ %.2f | SL=%.2f | TP=%s",
+        side, symbol, volumen, entry_price, stop_price, takeprofit_price,
     )
     order = requests.post(url, headers=headers, json=body, timeout=20)
+    if order.status_code >= 400:
+        log.error("SimpleFX error %d: %s", order.status_code, order.text)
     order.raise_for_status()
     log.info("Orden aceptada: %s", order.json())
     return order

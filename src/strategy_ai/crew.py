@@ -10,6 +10,7 @@ from broker_api.login import sesion_simple
 from broker_api.make_order import orden_pending
 from utils.logger import get_logger
 from dotenv import load_dotenv
+from strategy_ai.tools.search_web import ScrapeMacroCalendarTool
 
 load_dotenv()
 log = get_logger(__name__)
@@ -162,15 +163,15 @@ class StrategyAi():
             vol_half = round(VOLUME_BASE / 2, 2) if risk == "COMPLETO" else round(VOLUME_BASE / 4, 2)
 
             if action == "LONG":
-                side = "Buy"
-                entry = box_high
-                stop = box_low
+                side = "BUY"
+                entry = round(box_high,1)
+                stop = round(box_low,1)
                 tp = round(box_high + amp_points, 2)
             elif action == "SHORT":
-                side = "Sell"
-                entry = box_low
-                stop = box_high
-                tp = round(box_low - amp_points, 2)
+                side = "SELL"
+                entry = round(box_low,1)
+                stop = round(box_high,1)
+                tp = round(box_low - amp_points, 1)
             else:
                 continue
 
@@ -257,6 +258,14 @@ class StrategyAi():
             config=self.tasks_config['decision'],  # type: ignore[index]
             output_pydantic=CrewDecisionOutput,
             output_file='',
+        )
+    
+    @agent
+    def macro_news_watcher(self) -> Agent:
+        return Agent(
+            config=self.agents_config['macro_news_watcher'],
+            verbose=True,
+            tools=[ScrapeMacroCalendarTool()],
         )
 
     @crew

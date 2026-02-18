@@ -48,8 +48,8 @@ Agente de estrategia de la caja que funciona con la apertura del mercado america
 ## 📌 Requisitos
 
 - **Python** >= 3.12
-- Cuenta en [Capital.com](https://capital.com) (API de datos)
-- Cuenta en [SimpleFX](https://simplefx.com) (ejecución de órdenes)
+- Cuenta en [Capital.com](https://capital.com/referafriend?c=y9jyrped&pid=referral&src=inviteFriends&license=BAH&mn=ifbah1000) (API de datos)
+- Cuenta en [SimpleFX](https://simplefx.unilink.io/n/BYMENPY?promo_code_username=smartbox-trading) (ejecución de órdenes)
 - API key de [OpenAI](https://platform.openai.com)
 
 ---
