@@ -1,5 +1,5 @@
 # ── IA ────────────────────────────────────────────────
-MODEL=gpt-4o-mini
+MODEL=gpt-5-mini
 OPENAI_API_KEY=sk-tu-clave-aqui
 
 # ── Símbolos y temporalidad ───────────────────────────
@@ -23,7 +23,7 @@ API_KEY=tu-api-key
 ID=tu-client-id
 KEY=tu-client-secret
 SIMPLE_ACCOUNT=tu-cuenta
-SIMPLE_REALITY=Demo
+SIMPLE_REALITY=DEMO # o LIVE para cuentas reales 
 
 # ── Trading ───────────────────────────────────────────
 VOLUME=1.0 

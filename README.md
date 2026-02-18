@@ -108,22 +108,25 @@ TIMEFRAME=MINUTE_5
 
 # ── Caja ──────────────────────────────────────────────
 BOX_DATE=
-BOX_START=08:00
-BOX_END=09:55
+BOX_START=13:00 #consulte la hora de la apertura del mercado americano o del mercado de su preferencia, la hora esta en UTC 
+BOX_END=14:55
 
-# ── Capital.com (datos de mercado) ────────────────────
-EMAIL=tu-email@ejemplo.com
+# ──Volumen Profile ────────────────────────────────────
+START_VP=2026-02-12T00:00:00 #Rango para definir el volumen profile, la hora de la caja debe estar dentro del rango del volumen profile 
+END_VP=2026-02-18T14:55:00
+# ── Capital.com  ───────────────────────────────────────
+EMAIL=tu-email
 PASSWORD=tu-password
-API_KEY=tu-api-key-capital
+API_KEY=tu-api-key
 
-# ── SimpleFX (ejecución de órdenes) ──────────────────
+# ── SimpleFX ──────────────────────────────────────────
 ID=tu-client-id
 KEY=tu-client-secret
-SIMPLE_ACCOUNT=tu-numero-cuenta
-SIMPLE_REALITY=Demo
+SIMPLE_ACCOUNT=tu-cuenta
+SIMPLE_REALITY=DEMO # o LIVE para cuentas reales 
 
 # ── Trading ───────────────────────────────────────────
-VOLUME=1.0
+VOLUME=1.0 
 MAX_ORDERS_PER_DAY=4
 MAX_DAILY_LOSS=500.0
 
