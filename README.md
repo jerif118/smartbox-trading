@@ -144,8 +144,8 @@ LOG_LEVEL=INFO
 source venv/bin/activate        # Mac/Linux
 # venv\Scripts\activate         # Windows
 
-# Ejecutar
-python -m strategy_ai.main
+# Ejecutar en la raiz del proyecto
+crewai run 
 ```
 Nota: Ajuste `VOLUME` que es su lotaje según tu capital disponible y el riesgo que desee asumir 
 
