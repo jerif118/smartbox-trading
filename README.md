@@ -47,7 +47,7 @@ Agente de estrategia de la caja que funciona con la apertura del mercado america
 
 ## 📌 Requisitos
 
-- **Python** >= 3.10, < 3.14
+- **Python** >= 3.12
 - Cuenta en [Capital.com](https://capital.com) (API de datos)
 - Cuenta en [SimpleFX](https://simplefx.com) (ejecución de órdenes)
 - API key de [OpenAI](https://platform.openai.com)
