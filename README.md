@@ -99,7 +99,7 @@ Edita `.env` con tus datos reales:
 
 ```env
 # ── IA ────────────────────────────────────────────────
-MODEL=gpt-4o-mini
+MODEL=gpt-5-mini
 OPENAI_API_KEY=sk-tu-clave-aqui
 
 # ── Símbolos y temporalidad ───────────────────────────
