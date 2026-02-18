@@ -87,7 +87,7 @@ pip install -r requirements.txt
 ### 4. Verificar instalación
 
 ```bash
-python -c "import crewai; import pandas; print('✅ Todo instalado correctamente')"
+python -c "import crewai; import pandas; print('Todo instalado correctamente')"
 ```
 
 ---
@@ -155,7 +155,7 @@ Nota: Ajuste `VOLUME` que es su lotaje según tu capital disponible y el riesgo 
 
 ### Linux / Mac (cron)
 
-Ejecutar de lunes a viernes a las 7:50 AM (hora Perú):
+Ejecutar de lunes a viernes a las 7:50 AM (hora NY):
 
 ```bash
 # Abrir crontab
