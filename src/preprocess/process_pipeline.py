@@ -185,7 +185,7 @@ def preprocess_data(
     box_date: str | None = None,
     box_start_hour: str | None = None,
     box_end_hour: str | None = None,
-    max_candles: int = 1000,
+    max_candles: int = 500,
     use_cache: bool = True,
 ):
     """

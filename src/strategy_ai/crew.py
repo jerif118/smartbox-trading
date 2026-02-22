@@ -166,7 +166,7 @@ class StrategyAi():
                 side = "BUY"
                 entry = round(box_high,1)
                 stop = round(box_low,1)
-                tp = round(box_high + amp_points, 2)
+                tp = round(box_high + amp_points, 1 )
             elif action == "SHORT":
                 side = "SELL"
                 entry = round(box_low,1)

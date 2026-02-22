@@ -31,7 +31,7 @@ def _utc_now_iso() -> str:
 def _http_get(url: str, params: Optional[Dict[str, Any]] = None, timeout: int = 30) -> requests.Response:
     # Some sites are sensitive to missing Referer.
     headers = dict(DEFAULT_HEADERS)
-    headers["Referer"] = "https://www.investing.com/"
+    headers["Referer"] = "https://es.investing.com/earnings-calendar"
     r = requests.get(url, params=params, headers=headers, timeout=timeout)
     r.raise_for_status()
     return r

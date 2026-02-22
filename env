@@ -23,7 +23,9 @@ API_KEY=tu-api-key
 ID=tu-client-id
 KEY=tu-client-secret
 SIMPLE_ACCOUNT=tu-cuenta
-SIMPLE_REALITY=DEMO # o LIVE para cuentas reales 
+SIMPLE_REALITY=DEMO # o LIVE para cuentas reales
+VOLUME=0.06 #Administre el volumen de la operacion 
+LOG_LEVEL=INFO
 
 # ── Trading ───────────────────────────────────────────
 VOLUME=1.0 

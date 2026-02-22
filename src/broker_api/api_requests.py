@@ -24,7 +24,7 @@ def login_simple(client: str, api_key: str):
     return data
 
 
-@retry(max_retries=2, backoff=1.5, exceptions=(requests.RequestException,))
+@retry(max_retries=5, backoff=1.5, exceptions=(requests.RequestException,))
 def price_simple(symbol: str, timeframe: int, start: int | None = None, end: int | None = None) -> pd.DataFrame | None:
     url = f"{SIMPLE_URL}/api/v3/candles"
     params = {
@@ -71,7 +71,7 @@ def login_capital(email: str, pwd: str, api_key: str) -> dict:
     return {"CST": cst, "X-SECURITY-TOKEN": xst}
 
 
-@retry(max_retries=100, backoff=1.5, initial_delay=0.5, exceptions=(requests.RequestException,))
+@retry(max_retries=20, backoff=1.5, initial_delay=0.5, exceptions=(requests.RequestException,))
 def price_capital(
     symbol: str, time_resolution: str, from_date: str, to_date: str,
     max_number: str, toke_c: str, cst_token: str,

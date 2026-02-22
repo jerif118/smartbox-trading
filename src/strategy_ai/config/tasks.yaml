@@ -44,7 +44,7 @@ reglas_trader:
           → soporte inmediato, precaución.
 
     (3) RSI extremos:
-        - RSI > 80 y breakout ABOVE → sobrecompra, posible trampa alcista → NO_OPERAR.
+        - RSI > 70 y breakout ABOVE → sobrecompra, posible trampa alcista → NO_OPERAR.
         - RSI < 20 y breakout BELOW → sobreventa, posible trampa bajista → NO_OPERAR.
 
     (4) Macro risk (del paso anterior):
