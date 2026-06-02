@@ -7,7 +7,7 @@ log = get_logger(__name__)
 
 SIMPLE_BASE = "https://rest.simplefx.com"
 SIMPLE_URL = "https://candles-core.simplefx.com" 
-CAPITAL_URL = "https://api-capital.backend-capital.com/"
+CAPITAL_URL = "https://api-capital.backend-capital.com"
 
 
 @retry(max_retries=3, backoff=2.0, exceptions=(requests.RequestException,))
@@ -71,7 +71,7 @@ def login_capital(email: str, pwd: str, api_key: str) -> dict:
     return {"CST": cst, "X-SECURITY-TOKEN": xst}
 
 
-@retry(max_retries=20, backoff=1.5, initial_delay=0.5, exceptions=(requests.RequestException,))
+@retry(max_retries=5, backoff=1.5, initial_delay=0.5, exceptions=(requests.RequestException,))
 def price_capital(
     symbol: str, time_resolution: str, from_date: str, to_date: str,
     max_number: str, toke_c: str, cst_token: str,

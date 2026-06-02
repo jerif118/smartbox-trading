@@ -1,49 +1,101 @@
 import pandas as pd
-#from api_requests import price_capital
-from tools_bot.time_now import utc_time
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
 
-star_time = 1764130200
-end_time = 1767203400 
 
-#time = 60 
-#block = 500*60
-#cont = 0
-#price = []
-def date_ranges(star_time: int, end_time: int, time = 60, values = 500 ):
+def is_trading_day(date_str: str) -> bool:
+    dt = datetime.strptime(date_str[:10], "%Y-%m-%d")
+    return dt.weekday() < 5
+
+
+def is_market_open(dt: datetime, market_tz: str = "America/New_York") -> bool:
+    market = ZoneInfo(market_tz)
+    market_time = dt.astimezone(market).time()
+    market_open = time(9, 30)
+    market_close = time(16, 0)
+    return market_open <= market_time <= market_close
+
+
+def validate_date_range(start_dt: datetime, end_dt: datetime, tz_str: str) -> tuple[bool, datetime, datetime]:
+    tz = ZoneInfo(tz_str)
+    start_dt = start_dt.astimezone(tz)
+    end_dt = end_dt.astimezone(tz)
+
+    if end_dt <= start_dt:
+        return False, start_dt, end_dt
+
+    if not is_trading_day(start_dt.strftime("%Y-%m-%d")) or not is_trading_day(end_dt.strftime("%Y-%m-%d")):
+        return False, start_dt, end_dt
+
+    return True, start_dt, end_dt
+
+
+def filter_market_hours(df: pd.DataFrame, market_tz: str = "America/New_York") -> pd.DataFrame:
+    if df is None or df.empty or "time" not in df.columns:
+        return df
+
+    df = df.copy()
+    df["dt"] = pd.to_datetime(df["time"], unit="s", utc=True)
+    mask = df["dt"].apply(lambda x: is_market_open(x, market_tz))
+    filtered = df[mask].copy()
+    filtered = filtered.drop(columns=["dt"])
+    return filtered
+
+
+def date_ranges(start_time: int, end_time: int, time=60, values=500, tz_str: str = "America/New_York"):
     rangos = []
-    block = values*time
-    while star_time < end_time: 
-        interval = min(star_time+ block,end_time)
-        #cont+=1
-        rangos.append((utc_time(star_time), utc_time(interval)))
-        #print(interval,cont)
-        star_time = interval
-    #print("cantidad inicial:",len(rangos))
-    #print(rangos)
-    #for x, y in rangos:
-    #    if x.weekday() < 5 or y.weekday() < 5 :
-    #        cont+=1
-    #print(len(rangos))
-            
-    rangos = [(x, y)  for x, y in rangos if x.weekday() < 5 or y.weekday() < 5]
-    rangos = [(x.strftime("%Y-%m-%dT%H:%M:%S"), y.strftime("%Y-%m-%dT%H:%M:%S")) for x, y in rangos]
-    #print(len(rangos))
+    block = values * time
+    while start_time < end_time:
+        interval = min(start_time + block, end_time)
+        rangos.append((start_time, interval))
+        start_time = interval
+
+    rangos = [
+        (start_ts, end_ts)
+        for start_ts, end_ts in rangos
+        if _range_has_trading_hours(start_ts, end_ts, tz_str)
+    ]
+
+    rangos = [
+        (from_ts, to_ts)
+        for from_ts, to_ts in rangos
+        if _is_valid_trading_range(from_ts, to_ts, tz_str)
+    ]
+
     return rangos
-#for from_ ,to_ in rangos:
-    #cont+=1
-    #p = price_capital("US500","MINUTE",from_,to_,1000,"CUkgno0sPOwCPM75VZRBn6li4hT5LeV","e7NSWhXxFyR7zo8z0L4ePF2Y")
-    #price.append(p)
-#print(from_,to_)
 
-#print(price)
 
-#df = pd.concat([df_ for df_ in price if df_ is not None ], ignore_index=True)
+def _unix_to_dt(ts: int, tz_str: str = "UTC") -> datetime:
+    tz = ZoneInfo(tz_str)
+    return datetime.fromtimestamp(ts, tz=tz)
 
-#df_unico = df.drop_duplicates(subset=['snapshotTimeUTC'])
-#df_unico
 
-#from standar_data import standar_data
-#df_normalice = standar_data(df_unico)
+def _range_has_trading_hours(from_ts: int, to_ts: int, tz_str: str = "America/New_York") -> bool:
+    market_tz = ZoneInfo(tz_str)
+    from_dt = datetime.fromtimestamp(from_ts, tz=market_tz)
+    to_dt = datetime.fromtimestamp(to_ts, tz=market_tz)
+
+    if from_dt.weekday() >= 5 and to_dt.weekday() >= 5:
+        return False
+
+    return True
+
+
+def _is_valid_trading_range(from_ts: int, to_ts: int, tz_str: str = "America/New_York") -> bool:
+    market_tz = ZoneInfo(tz_str)
+    from_dt = datetime.fromtimestamp(from_ts, tz=market_tz)
+    to_dt = datetime.fromtimestamp(to_ts, tz=market_tz)
+
+    open_time = time(9, 30)
+    close_time = time(16, 0)
+
+    from_market = from_dt.time()
+    to_market = to_dt.time()
+
+    in_range = from_market < close_time and to_market > open_time
+    is_weekday = from_dt.weekday() < 5 and to_dt.weekday() < 5
+
+    return in_range and is_weekday
 
 
 

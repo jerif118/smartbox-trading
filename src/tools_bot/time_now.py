@@ -1,5 +1,5 @@
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("America/Lima")
@@ -24,5 +24,4 @@ def check_time():
 
 
 def utc_time(ts: int):
-    #return datetime.fromtimestamp(ts,tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-    return datetime.fromtimestamp(ts,tz=timezone.utc)
+    return datetime.fromtimestamp(ts, tz=timezone.utc)

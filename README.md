@@ -1,60 +1,66 @@
-# 📦 SmartBox Trading
+# SmartBox Trading
 
-Agente de estrategia de la caja que funciona con la apertura del mercado americano automatizado parcialmente con IA para la toma de decisiones de entrada a operativas en long o short
-
----
-
-## 📋 Tabla de contenidos
-
-- [Cómo funciona](#-cómo-funciona)
-- [Requisitos](#-requisitos)
-- [Instalación](#-instalación)
-- [Configuración](#-configuración)
-- [Ejecución](#-ejecución)
-- [Ejecución programada](#-ejecución-programada)
-- [Estructura del proyecto](#-estructura-del-proyecto)
-- [Descargo de responsabilidad](#-descargo-de-responsabilidad)
-- [Licencia](#-licencia)
+Agente automatizado para la estrategia de la **caja de apertura** del mercado americano (S&P 500 / NASDAQ). Combina datos de Capital.com, decisión multi-agente vía CrewAI y ejecución de órdenes en SimpleFX.
 
 ---
 
-## 🧠 Cómo funciona
+## Tabla de contenidos
+
+- [Cómo funciona](#cómo-funciona)
+- [Requisitos](#requisitos)
+- [Instalación local](#instalación-local)
+- [Configuración](#configuración)
+- [Ejecución](#ejecución)
+- [Docker](#docker)
+- [Ejecución programada](#ejecución-programada)
+- [Estructura del proyecto](#estructura-del-proyecto)
+- [Variables de entorno](#variables-de-entorno)
+- [Descargo de responsabilidad](#descargo-de-responsabilidad)
+- [Licencia](#licencia)
+
+---
+
+## Cómo funciona
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  1. CAJA (08:00 - 09:55 hora NY)                         │
+│  1. CAJA (ventana configurable, p.ej. 08:00 - 09:55 NY)     │
 │     → Calcula high / low / amplitud                         │
-│     → Si amplitud > 1% → NO OPERAR                         │
+│     → Si amplitud > 1% → NO OPERAR                          │
 │                                                             │
-│  2. MONITOREO (máx 2 horas post-caja)                      │
+│  2. MONITOREO (máx 2 horas post-caja)                       │
 │     → Velas de 5 min via Capital.com                        │
 │     → Detecta primer cierre fuera de la caja                │
 │       • Arriba → evaluar LONG                               │
 │       • Abajo  → evaluar SHORT                              │
 │                                                             │
-│  3. IA (CrewAI + GPT)                                       │
+│  3. IA (CrewAI jerárquico, 3 agentes)                       │
+│     → decision_maker, trader, risk_analyst                  │
 │     → Evalúa RSI, Volume Profile, contexto macro            │
 │     → Decide: LONG / SHORT / NO_OPERAR                      │
 │     → Define riesgo: COMPLETO / MEDIO                       │
 │                                                             │
 │  4. EJECUCIÓN (SimpleFX)                                    │
+│     → Validación cruzada: dirección IA == dirección breakout│
+│     → R:R >= MIN_RR_RATIO (default 1.5)                     │
 │     → Orden 1: 50% volumen con SL + TP                      │
 │     → Orden 2: 50% volumen con SL sin TP (runner)           │
+│     → DRY_RUN=true loguea sin enviar                        │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 📌 Requisitos
+## Requisitos
 
-- **Python** >= 3.12
-- Cuenta en [Capital.com](https://capital.com/referafriend?c=y9jyrped&pid=referral&src=inviteFriends&license=BAH&mn=ifbah1000) (API de datos)
-- Cuenta en [SimpleFX](https://simplefx.unilink.io/n/BYMENPY?promo_code_username=smartbox-trading) (ejecución de órdenes)
-- API key de [OpenAI](https://platform.openai.com)
+- **Python** 3.12 (o **Docker** + Docker Compose)
+- Cuenta en [Capital.com](https://capital.com/) — fuente de datos OHLC
+- Cuenta en [SimpleFX](https://simplefx.com/) — broker de ejecución
+- API key de [OpenAI](https://platform.openai.com/) — modelo LLM
 
 ---
 
-## 🛠 Instalación
+## Instalación local
 
 ### 1. Clonar el repositorio
 
@@ -67,197 +73,283 @@ cd smartbox-trading/agents/strategy_ai
 
 **Mac / Linux:**
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+python3.12 -m venv .venv
+source .venv/bin/activate
 ```
 
-**Windows:**
-```bash
-python -m venv venv
-venv\Scripts\activate
+**Windows (PowerShell):**
+```powershell
+py -3.12 -m venv .venv
+.venv\Scripts\Activate.ps1
 ```
 
-### 3. Instalar dependencias
+### 3. Instalar el paquete en modo editable
+
+> **Importante:** el proyecto usa un layout `src/` con varios paquetes top-level (`broker_api`, `preprocess`, `strategy_ai`, `tools_bot`, `utils`). Instalarlo con `pip install -e .` registra los módulos en el `PYTHONPATH` del intérprete — **sin esto los imports fallan** y `python -m strategy_ai.main` no encuentra `utils.logger`.
 
 ```bash
 pip install --upgrade pip
-pip install -r requirements.txt
+pip install -e .
 ```
 
 ### 4. Verificar instalación
 
 ```bash
-python -c "import crewai; import pandas; print('Todo instalado correctamente')"
+python -c "import strategy_ai, preprocess, broker_api, utils, tools_bot; print('OK')"
 ```
 
 ---
 
-## ⚙ Configuración
+## Configuración
 
+Copia la plantilla y edítala con tus credenciales:
 
-Edita `.env` con tus datos reales:
+```bash
+cp .env.exmple .env   # nota: el archivo plantilla se llama .env.exmple en este repo
+```
+
+### Mínimo necesario
 
 ```env
-# ── IA ────────────────────────────────────────────────
-MODEL=gpt-5-mini
-OPENAI_API_KEY=sk-tu-clave-aqui
+# ── IA ──────────────────────────────────────────────
+MODEL=gpt-4o-mini
+OPENAI_API_KEY=sk-...
 
-# ── Símbolos y temporalidad ───────────────────────────
+# ── Símbolos y temporalidad ─────────────────────────
 SYMBOLS=US500,US100
+PRIMARY_SYMBOL=US500
 TIMEFRAME=MINUTE_5
 
-# ── Caja ──────────────────────────────────────────────
+# ── Caja (UTC) ──────────────────────────────────────
+# Consulta la hora real de apertura del mercado destino.
 BOX_DATE=
-BOX_START=13:00 #consulte la hora de la apertura del mercado americano o del mercado de su preferencia, la hora esta en UTC 
+BOX_START=13:00
 BOX_END=14:55
 
-# ──Volumen Profile ────────────────────────────────────
-START_VP=2026-02-12T00:00:00 #Rango para definir el volumen profile, la hora de la caja debe estar dentro del rango del volumen profile 
-END_VP=2026-02-18T14:55:00
-# ── Capital.com  ───────────────────────────────────────
-EMAIL=tu-email
-PASSWORD=tu-password
-API_KEY=tu-api-key
+# ── Volume Profile ──────────────────────────────────
+# El rango DEBE contener la ventana de la caja.
+START_VP=2026-05-25T00:00:00
+END_VP=2026-06-02T14:55:00
 
-# ── SimpleFX ──────────────────────────────────────────
-ID=tu-client-id
-KEY=tu-client-secret
-SIMPLE_ACCOUNT=tu-cuenta
-SIMPLE_REALITY=DEMO # o LIVE para cuentas reales 
+# ── Capital.com (datos) ─────────────────────────────
+EMAIL=...
+PASSWORD=...
+API_KEY=...
 
-# ── Trading ───────────────────────────────────────────
-VOLUME=1.0 
+# ── SimpleFX (ejecución) ────────────────────────────
+ID=...
+KEY=...
+SIMPLE_ACCOUNT=...
+SIMPLE_REALITY=DEMO       # DEMO | LIVE
+
+# ── Trading ─────────────────────────────────────────
+VOLUME=1.0
 MAX_ORDERS_PER_DAY=4
-MAX_DAILY_LOSS=500.0
+MIN_RR_RATIO=1.5
+MIN_CONFIDENCE=0
 
-# ── Seguridad ─────────────────────────────────────────
-DRY_RUN=true
+# ── Seguridad ───────────────────────────────────────
+DRY_RUN=true              # true = simula sin enviar al broker
 LOG_LEVEL=INFO
 ```
 
+> El bot **respeta `DRY_RUN=true`** y calcula todo sin enviar órdenes. Úsalo siempre la primera vez.
 
 ---
 
-## 🚀 Ejecución
+## Ejecución
 
-### Ejecución manual
+Con el venv activo:
 
 ```bash
-# Activar entorno virtual
-source venv/bin/activate        # Mac/Linux
-# venv\Scripts\activate         # Windows
+# Forma estándar (módulo)
+python -m strategy_ai.main
 
-# Ejecutar en la raiz del proyecto
-crewai run 
+# Equivalente vía script instalado por pyproject
+strategy_ai
 ```
-Nota: Ajuste `VOLUME` que es su lotaje según tu capital disponible y el riesgo que desee asumir 
+
+Otras entradas registradas en `pyproject.toml`:
+
+| Comando | Descripción |
+|---|---|
+| `strategy_ai` / `run_crew` | Corrida única (= `main:run`) |
+| `train <N> <file>` | Entrena el crew N iteraciones |
+| `replay <task_id>` | Re-ejecuta una tarea concreta |
+| `test <N> <eval_llm>` | Test del crew |
+| `run_with_trigger '<json>'` | Ejecuta con payload externo |
 
 ---
 
-## ⏰ Ejecución programada
+## Docker
 
-### Linux / Mac (cron)
-
-Ejecutar de lunes a viernes a las 7:50 AM (hora NY):
+### Build y corrida única
 
 ```bash
-# Abrir crontab
+docker build -t smartbox-trading .
+docker run --rm --env-file .env \
+  -v "$(pwd)/src/data_loader:/app/data_loader" \
+  -v "$(pwd)/logs:/app/logs" \
+  smartbox-trading
+```
+
+### Con Docker Compose (recomendado)
+
+```bash
+docker compose up --build
+```
+
+El `docker-compose.yml` monta los volúmenes de caché de parquets (`data_loader/`) y `logs/` para que la información persista entre corridas y para no descargar de cero los datos de Volume Profile cada día.
+
+### Variables clave en el contenedor
+
+El `Dockerfile` ya fija:
+
+```
+TZ=America/New_York
+DATA_LOADER_PATH=/app/data_loader
+VP_LOADER_PATH=/app/data_loader/vp
+LOG_DIR=/app/logs
+```
+
+Si necesitas otra TZ, pásala con `docker run -e TZ=...` o sobreescríbela en `docker-compose.yml`.
+
+---
+
+## Ejecución programada
+
+El contenedor (o el script local) hace **una sola corrida** y termina; la recurrencia se delega al sistema.
+
+### Linux / Mac — cron del host invocando Docker
+
+```bash
 crontab -e
-
-# Agregar esta línea
-50 7 * * 1-5 cd /ruta/a/smartbox-trading/agents/strategy_ai && /ruta/a/venv/bin/python -m strategy_ai.main >> /tmp/smartbox.log 2>&1
 ```
 
-Verificar que se guardó:
-```bash
-crontab -l
+```cron
+# Lunes a viernes, 7:50 AM hora NY → Docker Compose
+50 7 * * 1-5 cd /ruta/al/proyecto/agents/strategy_ai && /usr/bin/docker compose run --rm bot >> /tmp/smartbox.log 2>&1
 ```
 
-### Windows (Task Scheduler)
+### Linux / Mac — cron sin Docker
 
-1. Crear archivo `run_strategy.bat`:
+```cron
+50 7 * * 1-5 cd /ruta/al/proyecto/agents/strategy_ai && /ruta/al/.venv/bin/python -m strategy_ai.main >> /tmp/smartbox.log 2>&1
+```
+
+### Windows — Task Scheduler
+
+Crear `run_strategy.bat`:
 
 ```bat
 @echo off
-cd /d "C:\ruta\a\smartbox-trading\agents\strategy_ai"
-call venv\Scripts\activate
-python -m strategy_ai.main >> strategy.log 2>&1
+cd /d "C:\ruta\al\proyecto\agents\strategy_ai"
+call .venv\Scripts\activate
+python -m strategy_ai.main >> logs\strategy.log 2>&1
 ```
 
-2. Abrir **Programador de tareas** (`Win + R` → `taskschd.msc`)
-3. **Crear tarea básica:**
-   - Nombre: `SmartBox Trading`
-   - Desencadenador: Diariamente, 7:50 AM
-   - Acción: Iniciar programa → seleccionar `run_strategy.bat`
-4. En **Condiciones**: desmarcar "Iniciar solo con AC"
-5. En **Configuración**: marcar "Ejecutar tarea lo antes posible si se perdió"
+Luego en **Programador de tareas** crear una tarea diaria a las 7:50 AM apuntando al `.bat`.
 
-> **Nota:** El bot valida internamente fines de semana y feriados. Si se ejecuta un sábado, se detiene automáticamente.
+> El bot detecta fines de semana internamente (`interval_fecha.is_trading_day`) y aborta limpio.
 
 ---
 
-## 📁 Estructura del proyecto
+## Estructura del proyecto
 
 ```
-smartbox-trading/
-└── agents/strategy_ai/
-    ├── src/
-    │   ├── broker_api/          # Login y órdenes (Capital.com + SimpleFX)
-    │   │   ├── login.py
-    │   │   ├── api_requests.py
-    │   │   └── make_order.py
-    │   │
-    │   ├── preprocess/          # Pipeline de datos
-    │   │   ├── process_pipeline.py   # Caja + RSI + VP
-    │   │   └── breakout_monitor.py   # Monitor de breakout post-caja
-    │   │
-    │   ├── tools_bot/           # Herramientas de análisis
-    │   │   ├── box.py               # Estrategia de la caja
-    │   │   ├── utils_trading_rsi.py # RSI + divergencias
-    │   │   ├── utils_trading_vp.py  # Volume Profile
-    │   │   ├── time_now.py          # Conversiones de tiempo
-    │   │   └── interval_fecha.py    # Rangos de fechas
-    │   │
-    │   ├── strategy_ai/         # CrewAI (agentes + tareas)
-    │   │   ├── crew.py              # Definición del crew
-    │   │   ├── main.py              # Orquestador principal
-    │   │   └── config/
-    │   │       ├── agents.yaml
-    │   │       └── tasks.yaml
-    │   │
-    │   ├── utils/               # Utilidades
-    │   │   ├── logger.py
-    │   │   ├── safety.py            # Validaciones de producción
-    │   │   └── env_validator.py
-    │   │
-    │   └── data_loader/         # Caché de datos (parquets)
-    │       └── vp/              # Parquets de 1 min para VP
-    │
-    ├── .env                     # Configuración (no subir a git)
-    ├── .env.example             # Plantilla de configuración
-    ├── requirements.txt
-    ├── pyproject.toml
-    └── README.md
+agents/strategy_ai/
+├── Dockerfile
+├── docker-compose.yml
+├── pyproject.toml              # configuración de paquete + scripts
+├── requirements.txt            # mirror de dependencias (instalación pip puro)
+├── .env.exmple                 # plantilla — copiar a .env
+├── src/
+│   ├── broker_api/             # Login y órdenes (Capital + SimpleFX)
+│   │   ├── login.py
+│   │   ├── api_requests.py
+│   │   └── make_order.py
+│   ├── preprocess/             # Pipeline de datos
+│   │   ├── process_pipeline.py # Caja + RSI + VP + caché parquet
+│   │   └── breakout_monitor.py # Monitor post-caja (live/histórico)
+│   ├── tools_bot/              # Cálculos puros
+│   │   ├── box.py
+│   │   ├── utils_trading_rsi.py
+│   │   ├── utils_trading_vp.py
+│   │   ├── time_now.py
+│   │   ├── interval_fecha.py
+│   │   └── standar_data.py
+│   ├── strategy_ai/            # CrewAI
+│   │   ├── main.py             # orquestador
+│   │   ├── crew.py             # 3 agentes + after_kickoff (órdenes)
+│   │   ├── config/
+│   │   │   ├── agents.yaml
+│   │   │   └── tasks.yaml
+│   │   └── tools/              # tools del crew (scraping, summarize, analyze)
+│   ├── utils/
+│   │   ├── logger.py
+│   │   ├── safety/env_validator.py
+│   │   └── retry.py
+│   └── data_loader/            # caché de parquets (montable como volumen)
+│       └── vp/
+├── tests/
+└── logs/
 ```
 
 ---
 
-## ⚠ Descargo de responsabilidad
+## Variables de entorno
+
+### Requeridas (validadas al arranque)
+
+| Variable | Descripción |
+|---|---|
+| `EMAIL`, `PASSWORD`, `API_KEY` | Credenciales Capital.com |
+| `ID`, `KEY`, `SIMPLE_ACCOUNT` | Credenciales SimpleFX |
+| `OPENAI_API_KEY` | API key OpenAI |
+| `SYMBOLS` | Lista CSV de instrumentos (`US500,US100`) |
+| `TIMEFRAME` | Resolución Capital (`MINUTE_5`, `MINUTE_15`, …) |
+| `START_VP`, `END_VP` | Rango ISO del Volume Profile (debe contener la caja) |
+
+### Opcionales con default
+
+| Variable | Default | Descripción |
+|---|---|---|
+| `PRIMARY_SYMBOL` | `US500` | Símbolo de referencia; el bot espera su breakout antes del veredicto final |
+| `BOX_START`, `BOX_END` | `08:00`, `09:55` | Ventana de la caja (UTC, según .env) |
+| `BOX_DATE` | hoy | Fecha de la caja `YYYY-MM-DD` |
+| `MARKET_TZ` | `America/New_York` | TZ del mercado |
+| `VOLUME` | `1.0` | Volumen base; se divide 50/50 entre las dos órdenes |
+| `MAX_ORDERS_PER_DAY` | `4` | Hard cap de órdenes enviadas en una corrida |
+| `MIN_RR_RATIO` | `1.5` | R:R mínimo para no descartar la operación |
+| `MIN_CONFIDENCE` | `0` | Confianza mínima del crew (0–100) |
+| `SIMPLE_REALITY` | `Demo` | `DEMO` o `LIVE` |
+| `DRY_RUN` | `false` | Si `true`, **no** se envían órdenes al broker |
+| `LOG_LEVEL` | `INFO` | Nivel de logging |
+| `LOG_DIR` | `./logs` (cwd) | Dónde escribir `strategy.log` rotativo. Si no es escribible, se usa solo stdout. |
+| `DATA_LOADER_PATH` | `src/data_loader` | Dónde escribir parquets (útil para volúmenes Docker) |
+| `VP_LOADER_PATH` | `${DATA_LOADER_PATH}/vp` | Parquets de 1-min para Volume Profile |
+
+---
+
+## Descargo de responsabilidad
 
 > **ADVERTENCIA**
 
 - El trading de instrumentos financieros conlleva un **alto nivel de riesgo** y puede no ser adecuado para todos los inversores.
-- **Puedes perder parte o la totalidad de tu capital invertido.** No inviertas dinero que no puedas permitirte perder.
+- **Puedes perder parte o la totalidad de tu capital invertido.**
 - Los resultados pasados **no garantizan** resultados futuros.
-- El autor de este software **no es un asesor financiero registrado** y no proporciona asesoramiento financiero, de inversión ni de trading.
-- **Tú eres el único responsable** de tus decisiones de trading y de cualquier ganancia o pérdida resultante.
-- Se recomienda encarecidamente si usted no conoce o no sabe nada acerca sobre el trading y el mercado de valores e indices, no use ni descargue este proyecto.
+- El autor **no es un asesor financiero registrado** y no proporciona asesoramiento de inversión.
+- **Tú eres el único responsable** de tus decisiones de trading.
 - Antes de operar con dinero real:
-  - Practica con una **cuenta demo** durante al menos 1 mes
-  - Comprende completamente la estrategia y sus riesgos
-  - Consulta con un **asesor financiero profesional**
-  - Establece límites de pérdida que puedas asumir
+  - Practica con una **cuenta demo** durante al menos 1 mes (`SIMPLE_REALITY=DEMO`, `DRY_RUN=true`).
+  - Comprende completamente la estrategia y sus riesgos.
+  - Consulta con un **asesor financiero profesional**.
+  - Establece límites de pérdida que puedas asumir.
 
 **Al usar este software, aceptas que lo haces bajo tu propio riesgo y responsabilidad.**
 
 ---
+
+## Licencia
+
+Ver [`LICENSE`](LICENSE).

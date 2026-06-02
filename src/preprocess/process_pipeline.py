@@ -3,8 +3,8 @@ import pandas as pd
 from dataclasses import dataclass
 from broker_api.login import sesion_capitalcom
 from broker_api.api_requests import price_capital, price_simple
-from tools_bot.interval_fecha import date_ranges
-from tools_bot.time_now import unix_time
+from tools_bot.interval_fecha import date_ranges, filter_market_hours, _unix_to_dt
+from tools_bot.time_now import unix_time, _unix_to_iso
 from tools_bot.box import box_strategy
 from tools_bot.utils_trading_rsi import rsi
 from tools_bot.utils_trading_vp import vp_features_compose
@@ -23,12 +23,17 @@ DEFAULT_END = os.getenv("END_VP")
 DEFAULT_BOX_DATE = os.getenv("BOX_DATE")  # "YYYY-MM-DD", si no se pasa usa end_date
 DEFAULT_BOX_START = os.getenv("BOX_START", "08:00")
 DEFAULT_BOX_END = os.getenv("BOX_END", "09:55")
+DEFAULT_MARKET_TZ = os.getenv("MARKET_TZ", "America/New_York")
 
-DATA_LOADER_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "data_loader"
+# Path de caché de parquets — overridable vía DATA_LOADER_PATH del .env
+# para permitir montar un volumen externo (Docker, k8s) sin tocar código.
+DATA_LOADER_PATH = os.getenv(
+    "DATA_LOADER_PATH",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data_loader")),
 )
-VP_LOADER_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "data_loader", "vp"
+VP_LOADER_PATH = os.getenv(
+    "VP_LOADER_PATH",
+    os.path.join(DATA_LOADER_PATH, "vp"),
 )
 
 # Mapeo de timeframe Capital.com -> segundos por vela (para date_ranges)
@@ -42,6 +47,8 @@ TIMEFRAME_SECONDS = {
     "DAY":       86400,
     "WEEK":      604800,
 }
+
+MAX_CANDLES_FOR_AI = 10
 
 
 @dataclass
@@ -80,16 +87,18 @@ def save_parquet(df: pd.DataFrame, symb: str, path: str = DATA_LOADER_PATH):
     return file
 
 
-def fetch_from_api(symbol, timeframe, start_unix, end_unix, max_candles):
+def fetch_from_api(symbol, timeframe, start_unix, end_unix, max_candles, market_tz: str = DEFAULT_MARKET_TZ):
     """Descarga velas desde la API de Capital.com en el rango unix dado."""
     security_token, cst = sesion_capitalcom()
     tf_seconds = TIMEFRAME_SECONDS.get(timeframe, 60)
-    intervalos = date_ranges(start_unix, end_unix, time=tf_seconds)
+    intervalos = date_ranges(start_unix, end_unix, time=tf_seconds, tz_str=market_tz)
 
     dataframe = []
-    for from_, to_ in intervalos:
+    for from_ts, to_ts in intervalos:
+        from_str = _unix_to_dt(from_ts, market_tz).strftime("%Y-%m-%dT%H:%M:%S")
+        to_str = _unix_to_dt(to_ts, market_tz).strftime("%Y-%m-%dT%H:%M:%S")
         price = price_capital(
-            symbol, timeframe, from_, to_, max_candles, security_token, cst
+            symbol, timeframe, from_str, to_str, max_candles, security_token, cst
         )
         dataframe.append(price)
 
@@ -98,9 +107,11 @@ def fetch_from_api(symbol, timeframe, start_unix, end_unix, max_candles):
         return pd.DataFrame()
 
     df = pd.concat(valid, ignore_index=True)
-    #print('no estandar',df)
     df_norm = standar_data(df)
-    return df_norm.drop_duplicates(subset=["time"]).sort_values("time").reset_index(drop=True)
+    df_filtered = filter_market_hours(df_norm, market_tz)
+    if df_filtered.empty:
+        return pd.DataFrame()
+    return df_filtered.drop_duplicates(subset=["time"]).sort_values("time").reset_index(drop=True)
 
 
 def merge_and_deduplicate(old_df: pd.DataFrame | None, new_df: pd.DataFrame) -> pd.DataFrame:
@@ -112,14 +123,14 @@ def merge_and_deduplicate(old_df: pd.DataFrame | None, new_df: pd.DataFrame) -> 
     return combined.drop_duplicates(subset=["time"]).sort_values("time").reset_index(drop=True)
 
 
-def load_or_fetch_vp(symbol: str, start_unix: int, end_unix: int, max_candles: int = 500) -> pd.DataFrame:
+def load_or_fetch_vp(symbol: str, start_unix: int, end_unix: int, max_candles: int = 500, market_tz: str = DEFAULT_MARKET_TZ) -> pd.DataFrame:
     """
     Carga o descarga datos de 1 minuto exclusivos para Volume Profile.
     Usa su propio parquet en VP_LOADER_PATH con el mismo flujo de caché
     (detecta huecos al inicio/final y descarga solo lo faltante).
     Siempre timeframe=MINUTE (60s) independiente del timeframe principal.
     """
-    vp_symb = f"{symbol}_vp"  # nombre separado para no colisionar
+    vp_symb = f"{symbol}_vp"
 
     df_in_range, df_full = loader_file(symb=vp_symb, start=start_unix, end=end_unix, path=VP_LOADER_PATH)
 
@@ -142,9 +153,13 @@ def load_or_fetch_vp(symbol: str, start_unix: int, end_unix: int, max_candles: i
         parts = [df_in_range]
         for gap_start, gap_end in missing:
             log.debug("  -> vp descargando ts=%d..%d", gap_start, gap_end)
-            df_gap = fetch_from_api(symbol, "MINUTE", gap_start, gap_end, max_candles)
-            if not df_gap.empty:
-                parts.append(df_gap)
+            try:
+                df_gap = fetch_from_api(symbol, "MINUTE", gap_start, gap_end, max_candles, market_tz)
+                if not df_gap.empty:
+                    parts.append(df_gap)
+            except Exception as e:
+                log.warning("[vp-cache] %s: gap vp ts=%d..%d falló (%s) → se continúa con caché",
+                            symbol, gap_start, gap_end, e)
 
         df_vp = merge_and_deduplicate(None, pd.concat(parts, ignore_index=True))
         df_full_updated = merge_and_deduplicate(df_full, df_vp)
@@ -155,13 +170,17 @@ def load_or_fetch_vp(symbol: str, start_unix: int, end_unix: int, max_candles: i
             (df_vp["time"] >= start_unix) & (df_vp["time"] <= end_unix)
         ].reset_index(drop=True)
 
-    # Sin caché o parquet vacío en rango -> descargar completo
     if df_full is not None:
         log.info("[vp-cache] %s: parquet VP existe pero sin datos en rango", symbol)
     else:
         log.info("[vp-api] %s: sin parquet VP, descargando completo 1min", symbol)
 
-    df_new = fetch_from_api(symbol, "MINUTE", start_unix, end_unix, max_candles)
+    try:
+        df_new = fetch_from_api(symbol, "MINUTE", start_unix, end_unix, max_candles, market_tz)
+    except Exception as e:
+        log.warning("[vp-warn] %s: descarga VP completa falló (%s)", symbol, e)
+        return pd.DataFrame()
+
     if df_new.empty:
         log.warning("[vp-warn] %s: no se obtuvieron datos VP de 1min", symbol)
         return pd.DataFrame()
@@ -187,6 +206,7 @@ def preprocess_data(
     box_end_hour: str | None = None,
     max_candles: int = 500,
     use_cache: bool = True,
+    market_tz: str = DEFAULT_MARKET_TZ,
 ):
     """
     Descarga, normaliza y calcula features para cualquier símbolo y rango.
@@ -256,14 +276,17 @@ def preprocess_data(
                 # Descargar solo los rangos faltantes
                 log.info("[cache] %s: %d filas en caché, descargando %d rango(s) faltante(s)",
                          symbol, len(df_in_range), len(missing_ranges))
-                security_token, cst = None, None
                 parts = [df_in_range]
 
                 for gap_start, gap_end in missing_ranges:
                     log.debug("  -> descargando ts=%d..%d", gap_start, gap_end)
-                    df_gap = fetch_from_api(symbol, timeframe, gap_start, gap_end, max_candles)
-                    if not df_gap.empty:
-                        parts.append(df_gap)
+                    try:
+                        df_gap = fetch_from_api(symbol, timeframe, gap_start, gap_end, max_candles, market_tz)
+                        if not df_gap.empty:
+                            parts.append(df_gap)
+                    except Exception as e:
+                        log.warning("[cache] %s: gap ts=%d..%d falló (%s) → se continúa con datos en caché",
+                                    symbol, gap_start, gap_end, e)
 
                 # Unir caché parcial + datos nuevos
                 df_unico = merge_and_deduplicate(None, pd.concat(parts, ignore_index=True))
@@ -281,9 +304,8 @@ def preprocess_data(
                 ].reset_index(drop=True)
 
         elif df_full is not None:
-            # Existe parquet pero no tiene datos en el rango → descargar todo el rango
             log.info("[cache] %s: parquet existe pero sin datos en rango, descargando completo", symbol)
-            df_new = fetch_from_api(symbol, timeframe, start_unix, end_unix, max_candles)
+            df_new = fetch_from_api(symbol, timeframe, start_unix, end_unix, max_candles, market_tz)
             if not df_new.empty:
                 df_full_updated = merge_and_deduplicate(df_full, df_new)
                 save_parquet(df_full_updated, symbol)
@@ -296,7 +318,7 @@ def preprocess_data(
     # ── Descarga completa si no hay caché ─────────────────────────────
     if df_unico is None:
         log.info("[api] %s: descargando rango completo ts=%d..%d", symbol, start_unix, end_unix)
-        df_new = fetch_from_api(symbol, timeframe, start_unix, end_unix, max_candles)
+        df_new = fetch_from_api(symbol, timeframe, start_unix, end_unix, max_candles, market_tz)
         if df_new.empty:
             raise RuntimeError(f"No se obtuvieron datos de la API para {symbol}")
         df_unico = df_new
@@ -341,15 +363,31 @@ def preprocess_data(
         f"{box_date}T{box_end_hour}:00",
     )
 
-    # Box desde datos del parquet (Capital.com)
+    df_box = df_unico[(df_unico["time"] >= box_from) & (df_unico["time"] <= box_to)]
+    box_candles = []
+    if not df_box.empty:
+        df_box_limited = df_box.tail(MAX_CANDLES_FOR_AI)
+        for _, row in df_box_limited.iterrows():
+            box_candles.append({
+                "time": _unix_to_iso(int(row["time"])),
+                "open": round(float(row["open"]), 2),
+                "high": round(float(row["high"]), 2),
+                "low": round(float(row["low"]), 2),
+                "close": round(float(row["close"]), 2),
+                "volume": float(row["volume"]) if "volume" in row else 0,
+            })
+
     high_price, low_price, amplitud = box_strategy(df_unico, box_from, box_to)
-    #print('capital_box', high_price,low_price, amplitud)
+
+    if high_price is None or low_price is None:
+        log.warning("[box] %s: sin velas en ventana de caja %s-%s -> descartado",
+                    symbol, box_start_hour, box_end_hour)
+        return None
 
     if amplitud is not None and amplitud > 1:
         log.warning("[box] %s: amplitud=%.2f%% > 1%% -> operativa nula", symbol, amplitud)
         return None
 
-    # Box desde SimpleFX (price_simple) para el mismo rango horario
     df_simple = price_simple(symbol, 300, box_from, box_to)
     if df_simple is not None and not df_simple.empty:
         high_simple, low_simple, amplitud_simple = box_strategy(df_simple, box_from, box_to)
@@ -357,7 +395,7 @@ def preprocess_data(
         high_simple, low_simple, amplitud_simple = None, None, None
 
     # ── Volume Profile (datos de 1 minuto, parquet paralelo) ─────────
-    df_vp_1min = load_or_fetch_vp(symbol, start_unix, end_unix, max_candles)
+    df_vp_1min = load_or_fetch_vp(symbol, start_unix, end_unix, max_candles, market_tz)
     if not df_vp_1min.empty:
         vp_data = vp_features_compose(df_vp_1min, start_date)
     else:
@@ -367,22 +405,23 @@ def preprocess_data(
 
     features = {
         "rsi_last": last_rsi,
-        "rsi_points": rsi_points,
         "box": {
             "hour_range": f"{box_start_hour}-{box_end_hour}",
             "high": high_price,
             "low": low_price,
+            "mid": round((high_price + low_price) / 2, 2) if high_price and low_price else None,
             "amplitud": amplitud,
             "high_simple": high_simple,
             "low_simple": low_simple,
             "amplitud_simple": amplitud_simple,
+            "candles": box_candles,
         },
         "volume_profile": vp_data,
     }
 
-    log.info("[features] %s | RSI=%s | Box=(%s-%s) | BoxSimple=(%s-%s) | VP=%s",
+    log.info("[features] %s | RSI=%s | Box=(%s-%s) | BoxSimple=(%s-%s) | VP=%s | BoxCandles=%d",
              symbol, last_rsi, low_price, high_price, low_simple, high_simple,
-             'OK' if vp_data else 'None')
+             'OK' if vp_data else 'None', len(box_candles))
 
     return PreprocessResult(
         symbols=symbol,

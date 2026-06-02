@@ -1,13 +1,18 @@
 import time as time_mod
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from broker_api.login import sesion_capitalcom
 from broker_api.api_requests import price_capital
 from tools_bot.standar_data import standar_data
 from tools_bot.time_now import _unix_to_iso
+from tools_bot.interval_fecha import filter_market_hours
 from utils.logger import get_logger
 
 log = get_logger(__name__)
+
+DEFAULT_MARKET_TZ = "America/New_York"
+
 
 def _check_candles(df, box_high: float, box_low: float) -> dict | None:
     for _, row in df.iterrows():
@@ -16,26 +21,29 @@ def _check_candles(df, box_high: float, box_low: float) -> dict | None:
             return {
                 "breakout_state": "ABOVE",
                 "candle_close": close,
-                "signal_time": int(row["time"]),
+                "signal_time": _unix_to_iso(int(row["time"])),
             }
         elif close < box_low:
             return {
                 "breakout_state": "BELOW",
                 "candle_close": close,
-                "signal_time": int(row["time"]),
+                "signal_time": _unix_to_iso(int(row["time"])),
             }
     return None
 
 
-def _fetch_5min(symbol: str, from_unix: int, to_unix: int,
-                sec_token: str, cst: str):
-    from_str = _unix_to_iso(from_unix)
-    to_str = _unix_to_iso(to_unix)
+def _fetch_5min(symbol: str, from_ts: int, to_ts: int,
+                sec_token: str, cst: str, market_tz: str = DEFAULT_MARKET_TZ):
+    from_str = _unix_to_iso(from_ts)
+    to_str = _unix_to_iso(to_ts)
     df = price_capital(symbol, "MINUTE_5", from_str, to_str,
                        "500", sec_token, cst)
     if df is None or df.empty:
         return None
     df = standar_data(df)
+    df = filter_market_hours(df, market_tz)
+    if df.empty:
+        return None
     return df.sort_values("time").reset_index(drop=True)
 
 
@@ -69,7 +77,7 @@ def monitor_breakout(
         if result:
             log.info("[monitor] %s: BREAKOUT %s close=%.2f @ %s",
                      symbol, result['breakout_state'], result['candle_close'],
-                     _unix_to_iso(result['signal_time']))
+                     result['signal_time'])
         else:
             log.info("[monitor] %s: sin breakout en ventana de 2 h", symbol)
         return result
@@ -110,8 +118,9 @@ def monitor_breakout(
         if df is not None and not df.empty:
             result = _check_candles(df, box_high, box_low)
             if result:
-                log.info("[monitor] %s: BREAKOUT %s close=%.2f",
-                         symbol, result['breakout_state'], result['candle_close'])
+                log.info("[monitor] %s: BREAKOUT %s close=%.2f @ %s",
+                         symbol, result['breakout_state'], result['candle_close'],
+                         result['signal_time'])
                 return result
             # Avanzar puntero para no reprocesar velas
             last_checked = int(df["time"].max())

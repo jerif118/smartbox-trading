@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -10,50 +11,87 @@ from dotenv import load_dotenv
 warnings.filterwarnings("ignore", category=SyntaxWarning, module="pysbd")
 load_dotenv()
 
-from utils.logger import get_logger                               # noqa: E402
-from utils.env_validator import validate_env                      # noqa: E402
-from preprocess.process_pipeline import preprocess_data           # noqa: E402
-from preprocess.breakout_monitor import monitor_breakout          # noqa: E402
-from tools_bot.time_now import unix_time                          # noqa: E402
-from strategy_ai.crew import StrategyAi                           # noqa: E402
+from utils.logger import get_logger
+from utils.env_validator import validate_env
+from preprocess.process_pipeline import preprocess_data
+from preprocess.breakout_monitor import monitor_breakout
+from tools_bot.time_now import unix_time
+from tools_bot.interval_fecha import is_trading_day
+from strategy_ai.crew import StrategyAi
 
 log = get_logger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────
 SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "US500").split(",")]
-MARKET  = os.getenv("MARKET", "S&P 500 / Forex")
-TZ      = ZoneInfo("America/Lima")
+PRIMARY_SYMBOL = os.getenv("PRIMARY_SYMBOL", "US500")
+MARKET = os.getenv("MARKET", "S&P 500 / Forex")
+TZ_STR = os.getenv("TIMEZONE", "America/New_York")
+MARKET_TZ = os.getenv("MARKET_TZ", "America/New_York")
+TZ = ZoneInfo(TZ_STR)
 BOX_END_HOUR = os.getenv("BOX_END", "09:55")
+BOX_START_HOUR = os.getenv("BOX_START", "08:00")
+MIN_CONFLUENCE_SCORE = 60
 
 
 def _box_date() -> str:
-    """Devuelve BOX_DATE del .env o la fecha de hoy (hora Lima)."""
     bd = os.getenv("BOX_DATE")
     return bd if bd else datetime.now(TZ).strftime("%Y-%m-%d")
 
 
+def _is_primary(symbol: str) -> bool:
+    return symbol.upper().replace("-", "_") == PRIMARY_SYMBOL.upper().replace("-", "_")
+
+
+def _get_box_times(box_date: str):
+    start_str = f"{box_date}T{BOX_START_HOUR}:00"
+    end_str = f"{box_date}T{BOX_END_HOUR}:00"
+    return unix_time(start_str, end_str)
+
+
+def _monitor_sym(sym: str, tradeable: dict, box_date: str):
+    result = tradeable[sym]
+    box = result.features.get("box", {})
+    bh, bl = box.get("high"), box.get("low")
+    if bh is None or bl is None:
+        return sym, None
+    _, box_end_unix = _get_box_times(box_date)
+    return sym, monitor_breakout(sym, bh, bl, box_end_unix)
+
+
 # ══════════════════════════════════════════════════════════════════════
-#  FLUJO PRINCIPAL
+#  FLUJO PRINCIPAL - Agentes expertos evalúan dinámicamente
 # ══════════════════════════════════════════════════════════════════════
 
 def run():
-    """Ejecuta el flujo completo de la estrategia de la caja."""
+    """
+    Trader humano: envía TODOS los breakouts a los agentes expertos.
+    Cada agente pesa los factores según contexto político/económico del día.
+    Los agentes debaten yunan consensus sobre cuál es el MEJOR setup.
+    """
 
-    # ═══ Validación de entorno ════════════════════════════════════
     if not validate_env():
         log.error("Proceso abortado: variables de entorno incompletas")
         sys.exit(1)
 
     box_date = _box_date()
 
-    # ═══ ETAPA 1 · Preprocesamiento ══════════════════════════════════
+    if not is_trading_day(box_date):
+        log.warning("[skip] %s fin de semana.", box_date)
+        return
+
+    _, primary_box_end = _get_box_times(box_date)
+    max_wait = primary_box_end + 7200
+
     log.info("═" * 60)
-    log.info("  ETAPA 1 · Preprocesamiento  (%d símbolo(s))", len(SYMBOLS))
-    log.info("  Fecha caja : %s", box_date)
+    log.info("  EVALUACIÓN MULTI-SÍMBOLO CON AGENTES EXPERTOS")
+    log.info("  PRIMARY: %s | Box close: %s | Max wait: 2h post close", PRIMARY_SYMBOL, BOX_END_HOUR)
     log.info("═" * 60)
 
+    # ─── ETAPA 1: Preprocesamiento parallel ────
+    log.info("  ETAPA 1 · Preprocesamiento (%d símbolos)", len(SYMBOLS))
+
     preprocessed: dict = {}
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    with ThreadPoolExecutor(max_workers=len(SYMBOLS)) as pool:
         futures = {pool.submit(preprocess_data, symbol=s): s for s in SYMBOLS}
         for future in as_completed(futures):
             sym = futures[future]
@@ -63,107 +101,124 @@ def run():
                 log.error("[preprocess] %s: ERROR → %s", sym, e, exc_info=True)
                 preprocessed[sym] = None
 
-    # ═══ ETAPA 2 · Filtro de amplitud ════════════════════════════════
-    tradeable: dict = {}
-    for sym, result in preprocessed.items():
-        if result is None:
-            log.warning("[filtro] %s: amplitud > 1%% o sin datos → NO se consulta la IA", sym)
-            continue
-        tradeable[sym] = result
-
+    tradeable = {sym: r for sym, r in preprocessed.items() if r is not None}
     if not tradeable:
-        log.info("[FIN] Ningún símbolo pasó el filtro de amplitud. Proceso detenido.")
+        log.info("[FIN] Ningún símbolo viable.")
         return
 
-    # ═══ ETAPA 3 · Monitoreo breakout 5 min (máx 2 h) ═══════════════
-    log.info("═" * 60)
-    log.info("  ETAPA 3 · Monitoreo breakout 5 min  (%d símbolo(s))", len(tradeable))
-    log.info("  Ventana máxima : 2 horas post cierre de caja")
-    log.info("═" * 60)
-
-    breakouts: dict = {}
-
-    def _monitor_sym(sym: str):
-        result = tradeable[sym]
-        box = result.features.get("box", {})
-        bh, bl = box.get("high"), box.get("low")
-        if bh is None or bl is None:
-            return sym, None
-        _, box_end_unix = unix_time(
-            f"{box_date}T{BOX_END_HOUR}:00",
-            f"{box_date}T{BOX_END_HOUR}:00",
-        )
-        log.info("[monitor] %s: caja %.2f–%.2f, vigilando 5 min post caja …", sym, bl, bh)
-        return sym, monitor_breakout(sym, bh, bl, box_end_unix)
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = {pool.submit(_monitor_sym, s): s for s in tradeable}
-        for future in as_completed(futures):
-            sym_key = futures[future]
-            try:
-                symbol, signal = future.result()
-                if signal:
-                    breakouts[symbol] = signal
-                    log.info("[BREAKOUT] %s: %s close=%s", symbol,
-                             signal['breakout_state'], signal['candle_close'])
-                else:
-                    log.info("[monitor] %s: sin breakout en 2 h → NO se consulta IA", sym_key)
-            except Exception as e:
-                log.error("[monitor] %s: error → %s", sym_key, e, exc_info=True)
-
-    if not breakouts:
-        log.info("[FIN] Ningún breakout detectado en 2 h. Proceso detenido sin consultar IA.")
-        return
-
-    # ═══ ETAPA 4 · Construir datos y lanzar IA ═══════════════════════
-    log.info("═" * 60)
-    log.info("  ETAPA 4 · Consulta IA  (%d breakout(s) detectados)", len(breakouts))
+    # ─── ETAPA 2: Boxes calculadas - información lista ────
+    log.info("  ETAPA 2 · Boxes calculadas (%d símbolos)", len(tradeable))
+    for sym, r in tradeable.items():
+        box = r.features.get("box", {})
+        vp = r.features.get("volume_profile") or {}
+        log.info("    %s: box %.2f-%.2f | amp=%.2f%% | RSI=%s | POC=%.2f",
+                sym, box.get("low"), box.get("high"), box.get("amplitud"),
+                r.features.get("rsi_last"), vp.get("poc"))
     log.info("═" * 60)
 
-    symbols_data  = []
-    execution_data = {}
+    # ─── ETAPA 3: Monitoreo - todos los breakouts ────
+    log.info("  ETAPA 3 · Esperando breakouts (max 2h post close)")
 
-    for sym, signal in breakouts.items():
-        result   = tradeable[sym]
-        features = result.features
-        box = features.get("box", {})
-        vp  = features.get("volume_profile") or {}
+    all_breakouts: dict = {}
+    primary_breakout_detected = False
 
-        bh, bl = box.get("high"), box.get("low")
-        box_mid = round((bh + bl) / 2, 2) if bh and bl else None
-
-        # Datos para ejecutar la orden (SimpleFX / fallback Capital)
-        execution_data[sym] = {
-            "box_high":         bh,
-            "box_low":          bl,
-            "amplitud":         box.get("amplitud"),
-            "high_simple":      box.get("high_simple"),
-            "low_simple":       box.get("low_simple"),
-            "amplitud_simple":  box.get("amplitud_simple"),
+    with ThreadPoolExecutor(max_workers=len(tradeable)) as pool:
+        futures = {
+            pool.submit(_monitor_sym, sym, tradeable, box_date): sym
+            for sym in tradeable
         }
 
-        # JSON que recibe la IA (sin datos SimpleFX)
+        for future in as_completed(futures):
+            sym_key, result_data = future.result()
+            current_ts = int(datetime.now(ZoneInfo(MARKET_TZ)).timestamp())
+
+            if result_data is None:
+                log.info("  [%s] sin breakout", sym_key)
+                continue
+
+            all_breakouts[sym_key] = {
+                "signal": result_data,
+                "is_primary": _is_primary(sym_key),
+                "features": tradeable[sym_key].features,
+            }
+
+            if _is_primary(sym_key):
+                primary_breakout_detected = True
+
+            log.info("  [%s] BREAKOUT %s @ %s | primary=%s",
+                    sym_key, result_data["breakout_state"],
+                    result_data["candle_close"], _is_primary(sym_key))
+
+            # Si primary rompió y cerró, romper loop
+            if _is_primary(sym_key) and current_ts >= primary_box_end:
+                log.info("  [PRIMARY] cerró box - recopilando breakouts finales")
+                break
+
+    # ─── ETAPA 4: Enviar TODOS los breakouts a agentes ────
+    log.info("═" * 60)
+    log.info("  ETAPA 4 · Enviando %d breakout(s) a agentes expertos", len(all_breakouts))
+    log.info("═" * 60)
+
+    if not all_breakouts:
+        log.info("[FIN] Sin breakouts detectados.")
+        return
+
+    # Si primary no rompió, esperar su cierre antes de decisión final
+    current_ts = int(datetime.now(ZoneInfo(MARKET_TZ)).timestamp())
+    if not primary_breakout_detected and current_ts < primary_box_end:
+        wait_secs = primary_box_end - current_ts
+        log.info("  [gate] Primary sin breakout - esperando cierre: %ds", wait_secs)
+        time.sleep(min(wait_secs, 300))
+    elif current_ts < primary_box_end:
+        wait_secs = primary_box_end - current_ts
+        log.info("  [gate] Esperando cierre primary: %ds", wait_secs)
+        time.sleep(min(wait_secs, 120))
+
+    # ─── Construir symbols_data con TODOS los breakouts ────
+    symbols_data = []
+    execution_data = {}
+
+    for sym, data in all_breakouts.items():
+        result = tradeable[sym]
+        features = result.features
+        box = features.get("box", {})
+        vp = features.get("volume_profile") or {}
+        signal = data["signal"]
+
+        bh, bl = box.get("high"), box.get("low")
+        box_mid = box.get("mid")
+
+        execution_data[sym] = {
+            "box_high": bh,
+            "box_low": bl,
+            "amplitud": box.get("amplitud"),
+            "high_simple": box.get("high_simple"),
+            "low_simple": box.get("low_simple"),
+        }
+
         symbols_data.append({
             "symbol": sym,
-            "breakout_signal": signal,
+            "is_primary": data["is_primary"],
+            "market_tz": MARKET_TZ,
+            "breakout_signal": {
+                "state": signal.get("breakout_state"),
+                "close": signal.get("candle_close"),
+                "time": signal.get("signal_time"),
+            },
             "caja": {
                 "high": bh,
-                "low":  bl,
-                "mid":  box_mid,
+                "low": bl,
+                "mid": box_mid,
                 "amp_pct": box.get("amplitud"),
                 "hour_range": box.get("hour_range"),
+                "candles": box.get("candles", []),
             },
             "vp": {
-                "poc":   vp.get("poc"),
-                "hva":   vp.get("vah"),
-                "lva":   vp.get("val"),
-                "peaks": vp.get("peaks", []),
-                "total_volume": vp.get("total_volume"),
+                "poc": vp.get("poc"),
+                "hva": vp.get("vah"),
+                "lva": vp.get("val"),
             },
-            "rsi": {
-                "last":   features.get("rsi_last"),
-                "points": features.get("rsi_points", []),
-            },
+            "rsi": {"last": features.get("rsi_last")},
         })
 
     inputs = {
@@ -171,13 +226,15 @@ def run():
         "market": MARKET,
     }
 
-    # Crear crew e inyectar datos de ejecución para after_kickoff
+    log.info("  Enviando al crew: %s", [s["symbol"] for s in symbols_data])
+
     strategy = StrategyAi()
     strategy._execution_data = execution_data
+    strategy._breakouts = {sym: data["signal"] for sym, data in all_breakouts.items()}
 
     try:
         strategy.crew().kickoff(inputs=inputs)
-        log.info("[FIN] Crew finalizado correctamente.")
+        log.info("[FIN] Crew finalizado.")
     except Exception as e:
         log.critical("Error ejecutando el crew: %s", e, exc_info=True)
         raise
@@ -239,3 +296,8 @@ def run_with_trigger():
         return StrategyAi().crew().kickoff(inputs=inputs)
     except Exception as e:
         raise Exception(f"Error con trigger: {e}")
+
+
+# ── Entrypoint cuando se ejecuta con `python -m strategy_ai.main` ─────
+if __name__ == "__main__":
+    run()

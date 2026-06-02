@@ -1,0 +1,41 @@
+# Secretos / entorno
+.env
+.env.*
+!.env.example
+!.env.exmple
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+build/
+dist/
+
+# Entornos virtuales locales
+.venv/
+venv/
+.conda/
+
+# Datos en caché y artefactos de runtime (el contenedor los regenera)
+src/data_loader/*.parquet
+src/data_loader/vp/*.parquet
+logs/
+*.log
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Tests / docs locales
+tests/
+knowledge/
+uv.lock
+LICENSE

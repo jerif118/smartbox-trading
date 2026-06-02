@@ -1,0 +1,26 @@
+# Uso:
+#   docker compose up --build           # corrida única
+#   docker compose run --rm bot         # con stdin/argumentos custom
+#
+# Para programación recurrente, usa cron del host:
+#   50 7 * * 1-5  cd /ruta/al/proyecto && docker compose run --rm bot >> /tmp/smartbox.log 2>&1
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: smartbox-trading:latest
+    container_name: smartbox-trading
+    env_file:
+      - .env
+    environment:
+      TZ: America/New_York
+      DATA_LOADER_PATH: /app/data_loader
+      VP_LOADER_PATH: /app/data_loader/vp
+      LOG_DIR: /app/logs
+    # Persistir caché de parquets y logs entre corridas
+    volumes:
+      - ./src/data_loader:/app/data_loader
+      - ./logs:/app/logs
+    restart: "no"

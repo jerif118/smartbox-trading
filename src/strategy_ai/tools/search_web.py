@@ -387,3 +387,63 @@ class ScrapeMacroCalendarTool(BaseTool):
 
         return json.dumps(data, ensure_ascii=False)
 
+
+# -----------------------------------------------------------------------------
+# News Search Tool - for political/economic panorama
+# -----------------------------------------------------------------------------
+
+class SearchNewsInput(BaseModel):
+    query: str = Field(..., description="Búsqueda para noticias financieras/políticas")
+    max_results: int = Field(5, ge=1, le=20, description="Número máximo de resultados")
+
+
+class SearchNewsTool(BaseTool):
+    name: str = "search_financial_news"
+    description: str = (
+        "Busca noticias financieras y políticas actuales usando DuckDuckGo. "
+        "Útil para evaluar el panorama macroeconómico y político antes de decisiones de trading. "
+        "Devuelve título, snippet y URL de cada noticia. NO inventa noticias."
+    )
+    args_schema: type = SearchNewsInput
+
+    def _run(self, query: str, max_results: int = 5) -> str:
+        try:
+            url = "https://duckduckgo.com/html/"
+            params = {"q": query, "kl": "us-en"}
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+            }
+            resp = requests.get(url, params=params, headers=headers, timeout=15)
+            resp.raise_for_status()
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+            results = []
+
+            for item in soup.find_all("a", class_="result__a")[:max_results]:
+                title = item.get_text(strip=True)
+                snippet_elem = item.find_parent("li").find("a", class_="result__snippet") if item.find_parent("li") else None
+                snippet = snippet_elem.get_text(strip=True) if snippet_elem else ""
+                results.append({
+                    "title": title,
+                    "snippet": snippet,
+                    "url": item.get("href", ""),
+                })
+
+            if not results:
+                return json.dumps({"ok": False, "query": query, "error": "no_results", "news": []})
+
+            return json.dumps({
+                "ok": True,
+                "query": query,
+                "count": len(results),
+                "news": results,
+            }, ensure_ascii=False)
+
+        except Exception as e:
+            return json.dumps({
+                "ok": False,
+                "query": query,
+                "error": str(e),
+                "news": [],
+            })
+
