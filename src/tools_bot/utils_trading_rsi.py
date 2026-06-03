@@ -1,6 +1,6 @@
 #import os
-import pandas as pd
 import pandas_ta as ta
+
 #from dotenv import load_dotenv
 #from api_requests import api_price
 #load_dotenv()

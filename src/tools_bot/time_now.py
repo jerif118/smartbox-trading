@@ -1,6 +1,7 @@
-import pandas as pd
-from datetime import datetime, time, timezone
+from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
+
+import pandas as pd
 
 TZ = ZoneInfo("America/Lima")
 FECHA_NOW = pd.Timestamp.now(TZ).strftime("%Y-%m-%d")
@@ -16,7 +17,7 @@ def unix_time(start_:str, end_: str):
     return(int(start.timestamp()),int(end.timestamp()))
 
 def _unix_to_iso(ts: int) -> str:
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    return datetime.fromtimestamp(ts, tz=UTC).strftime("%Y-%m-%dT%H:%M:%S")
 
 
 def check_time():
@@ -24,4 +25,4 @@ def check_time():
 
 
 def utc_time(ts: int):
-    return datetime.fromtimestamp(ts, tz=timezone.utc)
+    return datetime.fromtimestamp(ts, tz=UTC)

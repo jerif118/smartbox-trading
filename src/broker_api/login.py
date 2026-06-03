@@ -1,5 +1,7 @@
 import os
+
 from dotenv import load_dotenv
+
 from broker_api.api_requests import login_capital, login_simple
 from utils.logger import get_logger
 

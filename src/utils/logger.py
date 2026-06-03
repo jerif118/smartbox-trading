@@ -6,9 +6,9 @@ Uso:
     log.info("mensaje")
 """
 
+import logging
 import os
 import sys
-import logging
 from pathlib import Path
 
 _LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()

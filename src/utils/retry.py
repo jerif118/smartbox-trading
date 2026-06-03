@@ -1,5 +1,6 @@
-import time
 import functools
+import time
+
 from utils.logger import get_logger
 
 log = get_logger(__name__)

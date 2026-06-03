@@ -1,14 +1,12 @@
 
-import os
 import json
-from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any, Literal
+from datetime import UTC, datetime
+from typing import Any, Literal
 
 import requests
 from bs4 import BeautifulSoup
-from pydantic import BaseModel, Field
 from crewai.tools import BaseTool
-
+from pydantic import BaseModel, Field
 
 # -----------------------------------------------------------------------------
 # Deterministic scrapers for the specific sources declared in agents.yaml.
@@ -25,10 +23,10 @@ DEFAULT_HEADERS = {
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _http_get(url: str, params: Optional[Dict[str, Any]] = None, timeout: int = 30) -> requests.Response:
+def _http_get(url: str, params: dict[str, Any] | None = None, timeout: int = 30) -> requests.Response:
     # Some sites are sensitive to missing Referer.
     headers = dict(DEFAULT_HEADERS)
     headers["Referer"] = "https://es.investing.com/earnings-calendar"
@@ -46,7 +44,7 @@ def _scrape_investing_economic_widget(
     time_zone: str = "8",  # widget timezone id; DO NOT convert times
     lang: str = "1",       # 1=en, 4=es sometimes varies; keep configurable
     max_rows: int = 200,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Scrape Investing economic calendar using the iframe/widget endpoint.
 
     This endpoint is more stable than scraping the full page UI.
@@ -89,14 +87,14 @@ def _scrape_investing_economic_widget(
         }
 
     # Extract rows
-    events: List[Dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
 
     # The widget frequently uses date separator rows. We'll keep the last seen date label.
-    current_date_label: Optional[str] = None
+    current_date_label: str | None = None
 
     for tr in table.find_all("tr"):
         # date separator rows
-        if tr.get("class") and any("theDay" in c or "theDay" == c for c in tr.get("class")):  # defensive
+        if tr.get("class") and any("theDay" in c or c == "theDay" for c in tr.get("class")):  # defensive
             current_date_label = tr.get_text(" ", strip=True) or current_date_label
             continue
 
@@ -178,7 +176,7 @@ def _scrape_investing_economic_widget(
 # BabyPips calendar (best-effort HTML parse)
 # ----------------------------
 
-def _scrape_babypips_calendar(max_rows: int = 200) -> Dict[str, Any]:
+def _scrape_babypips_calendar(max_rows: int = 200) -> dict[str, Any]:
     url = "https://www.babypips.com/economic-calendar"
     try:
         r = _http_get(url)
@@ -189,7 +187,7 @@ def _scrape_babypips_calendar(max_rows: int = 200) -> Dict[str, Any]:
 
     # BabyPips markup can change; we do a conservative extraction:
     # find rows that contain currency + event name.
-    events: List[Dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
 
     # Common pattern: table rows with data attributes
     rows = soup.find_all("tr")
@@ -251,7 +249,7 @@ def _scrape_babypips_calendar(max_rows: int = 200) -> Dict[str, Any]:
 # ForexFactory calendar (best-effort HTML parse)
 # ----------------------------
 
-def _scrape_forexfactory_calendar(max_rows: int = 200) -> Dict[str, Any]:
+def _scrape_forexfactory_calendar(max_rows: int = 200) -> dict[str, Any]:
     url = "https://www.forexfactory.com/calendar"
     try:
         r = _http_get(url)
@@ -262,9 +260,9 @@ def _scrape_forexfactory_calendar(max_rows: int = 200) -> Dict[str, Any]:
 
     # ForexFactory often uses a table with rows having class 'calendar__row'
     rows = soup.find_all("tr", class_=lambda x: x and "calendar__row" in x)
-    events: List[Dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
 
-    current_date_label: Optional[str] = None
+    current_date_label: str | None = None
 
     for tr in rows:
         # date label row

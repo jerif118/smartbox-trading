@@ -1,18 +1,19 @@
+import json
 import os
 import re
-import json
 from enum import Enum
+
 from crewai import Agent, Crew, Process, Task
-from crewai.project import CrewBase, agent, crew, task, before_kickoff, after_kickoff
 from crewai.agents.agent_builder.base_agent import BaseAgent
-from typing import List, Optional
+from crewai.project import CrewBase, after_kickoff, agent, before_kickoff, crew, task
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field
+
 from broker_api.login import sesion_simple
 from broker_api.make_order import orden_pending
-from utils.logger import get_logger
-from dotenv import load_dotenv
 from strategy_ai.tools.scraper_tools import ScrapeMacroCalendarTool, SearchNewsTool
-from strategy_ai.tools.team_tools import SummarizeContextTool, AnalyzeBoxTool
+from strategy_ai.tools.team_tools import AnalyzeBoxTool, SummarizeContextTool
+from utils.logger import get_logger
 
 load_dotenv()
 log = get_logger(__name__)
@@ -68,23 +69,23 @@ class BreakoutState(str, Enum):
 
 
 class TimingInfo(BaseModel):
-    box_end_time: Optional[str] = Field(None, description="ISO8601 fin de la caja")
-    trade_valid_until: Optional[str] = Field(None, description="ISO8601 ventana de validez (2h post caja)")
-    signal_time: Optional[str] = Field(None, description="ISO8601 timestamp de la señal de breakout")
+    box_end_time: str | None = Field(None, description="ISO8601 fin de la caja")
+    trade_valid_until: str | None = Field(None, description="ISO8601 ventana de validez (2h post caja)")
+    signal_time: str | None = Field(None, description="ISO8601 timestamp de la señal de breakout")
 
 
 class KeyLevels(BaseModel):
-    box_high: Optional[float] = Field(None, description="Parte superior de la caja")
-    box_low: Optional[float]  = Field(None, description="Parte inferior de la caja")
-    box_mid: Optional[float]  = Field(None, description="Punto medio de la caja")
-    poc: Optional[float] = Field(None, description="Point of Control del Volume Profile")
-    hva: Optional[float] = Field(None, description="High Value Area del VP")
-    lva: Optional[float] = Field(None, description="Low Value Area del VP")
+    box_high: float | None = Field(None, description="Parte superior de la caja")
+    box_low: float | None  = Field(None, description="Parte inferior de la caja")
+    box_mid: float | None  = Field(None, description="Punto medio de la caja")
+    poc: float | None = Field(None, description="Point of Control del Volume Profile")
+    hva: float | None = Field(None, description="High Value Area del VP")
+    lva: float | None = Field(None, description="Low Value Area del VP")
 
 
 class SignalInfo(BaseModel):
     breakout_state: BreakoutState = Field(..., description="Estado del breakout respecto a la caja")
-    candle_close: Optional[float] = Field(None, description="Precio de cierre de la vela de señal")
+    candle_close: float | None = Field(None, description="Precio de cierre de la vela de señal")
 
 
 class SymbolDecision(BaseModel):
@@ -93,7 +94,7 @@ class SymbolDecision(BaseModel):
     action: ActionType = Field(..., description="LONG, SHORT o NO_OPERAR")
     risk: RiskType = Field(RiskType.COMPLETO, description="COMPLETO (vol base) o MEDIO (vol/2)")
     confidence: int = Field(..., ge=0, le=100, description="Confianza de 0 a 100")
-    reasons: List[str] = Field(..., min_length=1, description="Razones que justifican la decisión")
+    reasons: list[str] = Field(..., min_length=1, description="Razones que justifican la decisión")
     timing: TimingInfo = Field(default_factory=TimingInfo)
     key_levels: KeyLevels
     signal: SignalInfo
@@ -101,17 +102,17 @@ class SymbolDecision(BaseModel):
 
 class CrewDecisionOutput(BaseModel):
     """Salida final del crew: lista de decisiones por símbolo."""
-    decisions: List[SymbolDecision] = Field(
+    decisions: list[SymbolDecision] = Field(
         ..., min_length=1,
         description="Una decisión por cada símbolo analizado"
     )
 
 
 @CrewBase
-class StrategyAi():
+class StrategyAi:
     """3-agent crew with real debate via inter-agent tools."""
-    agents: List[BaseAgent]
-    tasks: List[Task]
+    agents: list[BaseAgent]
+    tasks: list[Task]
 
     @before_kickoff
     def carga_data(self, inputs):
@@ -327,10 +328,6 @@ class StrategyAi():
     @task
     def evaluate_risk(self) -> Task:
         return Task(config=self.tasks_config['evaluate_risk'])
-
-    @task
-    def debate_resolution(self) -> Task:
-        return Task(config=self.tasks_config['debate_resolution'])
 
     @task
     def final_decision(self) -> Task:

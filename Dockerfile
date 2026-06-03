@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 # ─────────────────────────────────────────────────────────────────────────────
-# SmartBox Trading — imagen producción
+# SmartBox Trading v2 — imagen producción
 #   build:  docker build -t smartbox-trading .
 #   run :   docker run --rm --env-file .env smartbox-trading
 # ─────────────────────────────────────────────────────────────────────────────
@@ -18,12 +18,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copia metadata + código para que hatchling encuentre los paquetes
+# Copia metadata + código
 COPY pyproject.toml ./
 COPY src ./src
+COPY tests ./tests
 
-# Instala el paquete + dependencias en un prefijo aislado que copiaremos
-# al runtime.
+# Instala paquete + dependencias en prefijo aislado
 RUN pip install --upgrade pip \
     && pip install --prefix=/install .
 
@@ -34,9 +34,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     TZ=America/New_York \
-    DATA_LOADER_PATH=/app/data_loader \
-    VP_LOADER_PATH=/app/data_loader/vp \
-    LOG_DIR=/app/logs
+    DATA_LOADER_PATH=/app/data/parquet \
+    VP_LOADER_PATH=/app/data/parquet/vp \
+    LOG_DIR=/app/logs \
+    DB_PATH=/app/data/smartbox.db
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         tzdata \
@@ -52,17 +53,15 @@ WORKDIR /app
 # Copia paquetes ya instalados desde builder
 COPY --from=builder /install /usr/local
 
-# Directorios writables para caché de parquets y logs
-RUN mkdir -p /app/data_loader/vp /app/logs \
+# Directorios writables
+RUN mkdir -p /app/data/parquet/vp /app/logs \
     && chown -R app:app /app
 
 USER app
 
-# Healthcheck: comprueba que los paquetes principales importan
+# Healthcheck
 HEALTHCHECK --interval=5m --timeout=10s --start-period=10s --retries=2 \
-    CMD python -c "import strategy_ai, preprocess, broker_api, utils, tools_bot" || exit 1
+    CMD python -c "from interfaces.cli.main import main; main(['doctor'])" || exit 1
 
-# El comando por defecto ejecuta una corrida única.
-# Para programación recurrente usa cron del host, k8s CronJob, GitHub Actions
-# scheduled, o un orquestador que invoque `docker run`.
-CMD ["python", "-m", "strategy_ai.main"]
+# Comando por defecto: doctor (para verificar entorno)
+CMD ["python", "-m", "interfaces.cli.main", "doctor"]

@@ -1,9 +1,9 @@
 # Uso:
 #   docker compose up --build           # corrida única
-#   docker compose run --rm bot         # con stdin/argumentos custom
+#   docker compose up -d bot ui         # bot + UI en background
 #
 # Para programación recurrente, usa cron del host:
-#   50 7 * * 1-5  cd /ruta/al/proyecto && docker compose run --rm bot >> /tmp/smartbox.log 2>&1
+#   50 7 * * 1-5 cd /ruta/al/proyecto && docker compose run --rm bot >> /tmp/smartbox.log 2>&1
 
 services:
   bot:
@@ -11,16 +11,38 @@ services:
       context: .
       dockerfile: Dockerfile
     image: smartbox-trading:latest
-    container_name: smartbox-trading
+    container_name: smartbox-trading-bot
     env_file:
       - .env
     environment:
       TZ: America/New_York
-      DATA_LOADER_PATH: /app/data_loader
-      VP_LOADER_PATH: /app/data_loader/vp
+      DATA_LOADER_PATH: /app/data/parquet
+      VP_LOADER_PATH: /app/data/parquet/vp
       LOG_DIR: /app/logs
-    # Persistir caché de parquets y logs entre corridas
+      DB_PATH: /app/data/smartbox.db
     volumes:
-      - ./src/data_loader:/app/data_loader
+      - ./data:/app/data
       - ./logs:/app/logs
+    command: ["python", "-m", "interfaces.cli.main", "run"]
     restart: "no"
+
+  ui:
+    image: smartbox-trading:latest
+    container_name: smartbox-trading-ui
+    env_file:
+      - .env
+    environment:
+      DB_PATH: /app/data/smartbox.db
+    volumes:
+      - ./data:/app/data
+    command: >
+      streamlit run src/interfaces/streamlit/app.py
+        --server.address=0.0.0.0
+        --server.port=8501
+        --server.headless=true
+        --browser.gatherUsageStats=false
+    ports:
+      - "8501:8501"
+    depends_on:
+      - bot
+    restart: unless-stopped

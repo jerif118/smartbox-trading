@@ -1,12 +1,11 @@
 import time as time_mod
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+from datetime import UTC, datetime
 
-from broker_api.login import sesion_capitalcom
 from broker_api.api_requests import price_capital
+from broker_api.login import sesion_capitalcom
+from tools_bot.interval_fecha import filter_market_hours
 from tools_bot.standar_data import standar_data
 from tools_bot.time_now import _unix_to_iso
-from tools_bot.interval_fecha import filter_market_hours
 from utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -57,9 +56,9 @@ def monitor_breakout(
     window_seconds: int = 7200,
     poll_interval: int = 60,
 ) -> dict | None:
-    
+
     monitor_end = box_end_unix + window_seconds
-    now = int(datetime.now(timezone.utc).timestamp())
+    now = int(datetime.now(UTC).timestamp())
 
     security_token, cst = sesion_capitalcom()
 
@@ -92,7 +91,7 @@ def monitor_breakout(
     TOKEN_REFRESH = 25 * 60  # 25 minutos
 
     while True:
-        current = int(datetime.now(timezone.utc).timestamp())
+        current = int(datetime.now(UTC).timestamp())
         if current >= monitor_end:
             log.info("[monitor] %s: ventana de 2 h expirada → sin breakout", symbol)
             return None

@@ -1,11 +1,11 @@
 [project]
 name = "strategy_ai"
-version = "0.1.0"
+version = "0.2.0"
 description = "SmartBox Trading — agente CrewAI para estrategia de caja en apertura US"
 authors = [{ name = "Your Name", email = "you@example.com" }]
 requires-python = ">=3.12,<3.14"
 dependencies = [
-    "crewai[tools]==1.9.3",
+    "crewai[tools]>=1.9.3",
     "pandas>=2.0",
     "pandas_ta>=0.3.14b1",
     "numpy>=1.24",
@@ -13,28 +13,39 @@ dependencies = [
     "python-dotenv>=1.0",
     "requests>=2.31",
     "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "streamlit>=1.32",
+    "plotly>=5.18",
+    "streamlit-autorefresh>=1.0.3",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.0",
     "colorlog>=6.7",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+    "freezegun>=1.4",
+    "ruff>=0.5",
+]
+
 [project.scripts]
-strategy_ai      = "strategy_ai.main:run"
-run_crew         = "strategy_ai.main:run"
-train            = "strategy_ai.main:train"
-replay           = "strategy_ai.main:replay"
-test             = "strategy_ai.main:test"
-run_with_trigger = "strategy_ai.main:run_with_trigger"
+smartbox = "interfaces.cli.main:app"
+smartbox_ui = "interfaces.streamlit.app:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-# ─── Hatchling: src layout con varios paquetes top-level ────────────────
-# El directorio src/ no es un paquete (no tiene __init__.py); cada
-# subdirectorio se publica como paquete independiente para que los
-# imports `from utils.logger import ...`, `from preprocess... import ...`
-# funcionen tanto en desarrollo (`pip install -e .`) como en producción.
 [tool.hatch.build.targets.wheel]
 packages = [
+    "src/domain",
+    "src/application",
+    "src/infrastructure",
+    "src/pipeline",
+    "src/interfaces",
     "src/broker_api",
     "src/preprocess",
     "src/strategy_ai",
@@ -48,3 +59,30 @@ packages = [
 
 [tool.crewai]
 type = "crew"
+
+# ── Ruff ──────────────────────────────────────────────────────────────────
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RUF"]
+ignore = ["E501", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+# ── Pytest ────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = [
+    "regression: tests que verifican las 22 reglas originales de la estrategia",
+    "domain: tests puros de la capa de dominio (sin I/O)",
+    "slow: tests que tardan más de 1s",
+]

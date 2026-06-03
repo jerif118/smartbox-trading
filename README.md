@@ -1,256 +1,334 @@
-# SmartBox Trading
+# SmartBox Trading v2
 
-Agente automatizado para la estrategia de la **caja de apertura** del mercado americano (S&P 500 / NASDAQ). Combina datos de Capital.com, decisión multi-agente vía CrewAI y ejecución de órdenes en SimpleFX.
+Bot de trading automatizado para la estrategia de la **caja de apertura** del mercado americano (S&P 500 / NASDAQ / GER40). Combina datos de Capital.com, decisión multi-agente vía CrewAI, y ejecución de órdenes en SimpleFX — con persistencia SQLite, dashboard Streamlit, y soporte multi-provider LLM (OpenAI, Anthropic, Ollama, etc.).
 
 ---
 
 ## Tabla de contenidos
 
+- [Cambios de v2](#cambios-de-v2)
 - [Cómo funciona](#cómo-funciona)
+- [Arquitectura](#arquitectura)
 - [Requisitos](#requisitos)
-- [Instalación local](#instalación-local)
+- [Instalación](#instalación)
 - [Configuración](#configuración)
-- [Ejecución](#ejecución)
+- [Uso rápido](#uso-rápido)
+- [CLI](#cli)
+- [Dashboard Streamlit](#dashboard-streamlit)
 - [Docker](#docker)
-- [Ejecución programada](#ejecución-programada)
+- [Tests](#tests)
+- [Multi-provider LLM](#multi-provider-llm)
 - [Estructura del proyecto](#estructura-del-proyecto)
-- [Variables de entorno](#variables-de-entorno)
-- [Descargo de responsabilidad](#descargo-de-responsabilidad)
-- [Licencia](#licencia)
+
+---
+
+## Cambios de v2
+
+### Estrategia (preservada 100%)
+
+Las **22 reglas originales** se preservan verbatim. Cada una tiene un test de regresión en `tests/domain/strategy/test_regression.py`.
+
+### Mejoras nuevas
+
+- **5 agentes CrewAI** (antes 3): + `mtfa` (multi-timeframe) + `position_manager` (gestiona trades abiertos: BE en +1R, trailing en +2R)
+- **Persistencia SQLite** con 5 tablas: `runs`, `decisions`, `trades`, `agent_events`, `equity_snapshots`
+- **Dashboard Streamlit** con 3 secciones: dashboard, histórico, timeline de agentes
+- **Multi-provider LLM**: cada agente puede usar un provider/modelo distinto (OpenAI, Anthropic, Google, Mistral, DeepSeek, Groq, Ollama local, LM Studio local, OpenAI-compatible)
+- **Arquitectura pipeline + capas**: `domain / application / infrastructure / pipeline / interfaces`
+- **Pydantic Settings** tipado con validación
+- **Pydantic contracts** en cada stage del pipeline
+- **Ruff** para lint + format
+- **141+ tests** (22 regresión + 119 nuevos)
 
 ---
 
 ## Cómo funciona
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  1. CAJA (ventana configurable, p.ej. 08:00 - 09:55 NY)     │
-│     → Calcula high / low / amplitud                         │
-│     → Si amplitud > 1% → NO OPERAR                          │
-│                                                             │
-│  2. MONITOREO (máx 2 horas post-caja)                       │
-│     → Velas de 5 min via Capital.com                        │
-│     → Detecta primer cierre fuera de la caja                │
-│       • Arriba → evaluar LONG                               │
-│       • Abajo  → evaluar SHORT                              │
-│                                                             │
-│  3. IA (CrewAI jerárquico, 3 agentes)                       │
-│     → decision_maker, trader, risk_analyst                  │
-│     → Evalúa RSI, Volume Profile, contexto macro            │
-│     → Decide: LONG / SHORT / NO_OPERAR                      │
-│     → Define riesgo: COMPLETO / MEDIO                       │
-│                                                             │
-│  4. EJECUCIÓN (SimpleFX)                                    │
-│     → Validación cruzada: dirección IA == dirección breakout│
-│     → R:R >= MIN_RR_RATIO (default 1.5)                     │
-│     → Orden 1: 50% volumen con SL + TP                      │
-│     → Orden 2: 50% volumen con SL sin TP (runner)           │
-│     → DRY_RUN=true loguea sin enviar                        │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│  1. POSITION MANAGER (siempre primero)                               │
+│     → Gestiona trades abiertos (BE, trailing, cierre)               │
+│     → Trabaja contra SQLite como source of truth                    │
+│                                                                      │
+│  2. INGEST (paralelo por símbolo)                                    │
+│     → Descarga OHLCV desde Capital.com                              │
+│     → Caché parquet para no re-descargar                            │
+│                                                                      │
+│  3. PREPROCESS                                                       │
+│     → Box 08:00-09:55 NY (high/low/amplitud)                        │
+│     → RSI 14, Volume Profile (POC/VAH/VAL)                          │
+│     → Valida regla #1: amplitud > 1% → NO OPERAR                    │
+│                                                                      │
+│  4. SIGNAL                                                           │
+│     → Monitorea 5min post-caja (ventana 2h)                          │
+│     → Primer cierre fuera = breakout                                │
+│                                                                      │
+│  5. CONTEXT (macro)                                                  │
+│     → Scrapea calendario económico                                  │
+│     → Filtra HIGH impact events                                     │
+│                                                                      │
+│  6. ANALYZE (CrewAI)                                                 │
+│     → mtfa: confirma sesgo HTF (15m/1h/4h)                          │
+│     → trader: propone dirección con confluence_score                 │
+│     → risk_analyst: valida R:R, drawdown, correlación               │
+│     → decision_maker: decisión final estructurada                   │
+│                                                                      │
+│  7. EXECUTE                                                          │
+│     → 2 órdenes por símbolo (primary + runner)                      │
+│     → Valida R:R, coherencia, MAX_ORDERS_PER_DAY                    │
+│     → Persiste en SQLite ANTES de enviar                            │
+│     → Envía a SimpleFX (o simula si DRY_RUN)                        │
+│                                                                      │
+│  8. EQUITY SNAPSHOT                                                  │
+│     → Guarda balance, equity, open positions                        │
+└──────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Arquitectura
+
+### Capas
+
+```
+src/
+├── domain/                  # Reglas puras, sin I/O
+│   ├── strategy/            # Box, Decision, OrderSpec, Budget
+│   ├── indicators/          # RSI, Volume Profile
+│   ├── signals/             # Breakout
+│   └── context/             # Macro
+│
+├── application/             # Use cases + ports (interfaces)
+│   ├── use_cases/           # Orquestación
+│   ├── ports/               # Protocol interfaces
+│   └── agents/              # 5 agentes CrewAI
+│
+├── infrastructure/          # I/O (DB, HTTP, scrapers, LLM)
+│   ├── persistence/sqlite/  # DB + repos
+│   ├── broker/              # SimpleFX, Capital adapters
+│   ├── llm/                 # Multi-provider LLM
+│   ├── data_sources/        # Macro scraper, news
+│   └── config/              # Settings
+│
+├── pipeline/                # Stages + orchestrator
+│   ├── contracts/           # Pydantic Input/Output por stage
+│   └── stages/              # s1_ingest → s7_manage
+│
+└── interfaces/              # CLI + Streamlit
+    ├── cli/                 # python -m interfaces.cli.main
+    └── streamlit/           # Dashboard con 3 secciones
+```
+
+### Multi-provider LLM
+
+Cada agente puede usar un modelo distinto. Configura en `.env`:
+
+```env
+AGENT_DECISION_MAKER_MODEL=openai/gpt-4o-mini
+AGENT_TRADER_MODEL=openai/gpt-4o-mini
+AGENT_RISK_ANALYST_MODEL=openai/gpt-4o-mini
+AGENT_MTFA_MODEL=ollama/llama3.1              # local
+AGENT_POSITION_MANAGER_MODEL=anthropic/claude-3-5-sonnet
+```
+
+Providers soportados: `openai`, `anthropic`, `google`, `mistral`, `deepseek`, `groq`, `ollama`, `lm_studio`, `openai_compatible`.
 
 ---
 
 ## Requisitos
 
-- **Python** 3.12 (o **Docker** + Docker Compose)
+- Python 3.12 (o Docker)
 - Cuenta en [Capital.com](https://capital.com/) — fuente de datos OHLC
 - Cuenta en [SimpleFX](https://simplefx.com/) — broker de ejecución
-- API key de [OpenAI](https://platform.openai.com/) — modelo LLM
+- API key de al menos un provider LLM (OpenAI por defecto)
 
 ---
 
-## Instalación local
+## Instalación
 
-### 1. Clonar el repositorio
+### Local
 
 ```bash
-git clone https://github.com/tu-usuario/smartbox-trading.git
-cd smartbox-trading/agents/strategy_ai
-```
-
-### 2. Crear entorno virtual
-
-**Mac / Linux:**
-```bash
+cd agents/strategy_ai
 python3.12 -m venv .venv
 source .venv/bin/activate
-```
-
-**Windows (PowerShell):**
-```powershell
-py -3.12 -m venv .venv
-.venv\Scripts\Activate.ps1
-```
-
-### 3. Instalar el paquete en modo editable
-
-> **Importante:** el proyecto usa un layout `src/` con varios paquetes top-level (`broker_api`, `preprocess`, `strategy_ai`, `tools_bot`, `utils`). Instalarlo con `pip install -e .` registra los módulos en el `PYTHONPATH` del intérprete — **sin esto los imports fallan** y `python -m strategy_ai.main` no encuentra `utils.logger`.
-
-```bash
 pip install --upgrade pip
-pip install -e .
+pip install -e ".[dev]"
 ```
 
-### 4. Verificar instalación
+### Con uv (más rápido)
 
 ```bash
-python -c "import strategy_ai, preprocess, broker_api, utils, tools_bot; print('OK')"
+uv sync
 ```
 
 ---
 
 ## Configuración
 
-Copia la plantilla y edítala con tus credenciales:
-
 ```bash
-cp .env.exmple .env   # nota: el archivo plantilla se llama .env.exmple en este repo
+cp .env.exmple .env
+# Edita .env con tus credenciales
 ```
 
-### Mínimo necesario
+Variables mínimas requeridas:
 
 ```env
-# ── IA ──────────────────────────────────────────────
-MODEL=gpt-4o-mini
 OPENAI_API_KEY=sk-...
-
-# ── Símbolos y temporalidad ─────────────────────────
-SYMBOLS=US500,US100
-PRIMARY_SYMBOL=US500
-TIMEFRAME=MINUTE_5
-
-# ── Caja (UTC) ──────────────────────────────────────
-# Consulta la hora real de apertura del mercado destino.
-BOX_DATE=
-BOX_START=13:00
-BOX_END=14:55
-
-# ── Volume Profile ──────────────────────────────────
-# El rango DEBE contener la ventana de la caja.
-START_VP=2026-05-25T00:00:00
-END_VP=2026-06-02T14:55:00
-
-# ── Capital.com (datos) ─────────────────────────────
-EMAIL=...
+EMAIL=...        # Capital.com
 PASSWORD=...
-API_KEY=...
-
-# ── SimpleFX (ejecución) ────────────────────────────
-ID=...
-KEY=...
+API_KEY=...      # Capital.com
+ID=...           # SimpleFX
+KEY=...          # SimpleFX
 SIMPLE_ACCOUNT=...
-SIMPLE_REALITY=DEMO       # DEMO | LIVE
-
-# ── Trading ─────────────────────────────────────────
-VOLUME=1.0
-MAX_ORDERS_PER_DAY=4
-MIN_RR_RATIO=1.5
-MIN_CONFIDENCE=0
-
-# ── Seguridad ───────────────────────────────────────
-DRY_RUN=true              # true = simula sin enviar al broker
-LOG_LEVEL=INFO
+DRY_RUN=true     # SIEMPRE empieza en true
 ```
 
-> El bot **respeta `DRY_RUN=true`** y calcula todo sin enviar órdenes. Úsalo siempre la primera vez.
+### Multi-provider (opcional)
+
+```env
+# Ollama local
+OLLAMA_BASE_URL=http://localhost:11434
+AGENT_MTFA_MODEL=ollama/llama3.1
+
+# LM Studio local
+LM_STUDIO_BASE_URL=http://localhost:1234/v1
+# (lm_studio usa OpenAI-compatible)
+
+# Anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+AGENT_DECISION_MAKER_MODEL=anthropic/claude-3-5-sonnet-20241022
+
+# OpenAI-compatible (vLLM, text-generation-webui, etc.)
+OPENAI_COMPATIBLE_BASE_URL=http://localhost:8000/v1
+OPENAI_COMPATIBLE_API_KEY=dummy
+```
 
 ---
 
-## Ejecución
+## Uso rápido
 
-Con el venv activo:
+### 1. Diagnóstico
 
 ```bash
-# Forma estándar (módulo)
-python -m strategy_ai.main
-
-# Equivalente vía script instalado por pyproject
-strategy_ai
+python -m interfaces.cli.main doctor
 ```
 
-Otras entradas registradas en `pyproject.toml`:
+Verifica: API keys, DB, providers LLM locales (Ollama, LM Studio).
 
-| Comando | Descripción |
-|---|---|
-| `strategy_ai` / `run_crew` | Corrida única (= `main:run`) |
-| `train <N> <file>` | Entrena el crew N iteraciones |
-| `replay <task_id>` | Re-ejecuta una tarea concreta |
-| `test <N> <eval_llm>` | Test del crew |
-| `run_with_trigger '<json>'` | Ejecuta con payload externo |
+### 2. Correr el bot (DRY_RUN por defecto)
+
+```bash
+python -m interfaces.cli.main run
+# o explícito:
+python -m interfaces.cli.main run --dry-run
+```
+
+### 3. Ver el dashboard
+
+```bash
+streamlit run src/interfaces/streamlit/app.py
+# Abre http://localhost:8501
+```
+
+### 4. Ver status
+
+```bash
+python -m interfaces.cli.main status
+python -m interfaces.cli.main trades --limit 20
+```
+
+---
+
+## CLI
+
+```
+python -m interfaces.cli.main <comando>
+
+Comandos:
+  run [--dry-run]     Ejecuta el pipeline completo
+  doctor              Diagnóstico del sistema
+  status              Muestra runs y stats
+  trades [--limit N]  Lista últimos N trades
+```
+
+---
+
+## Dashboard Streamlit
+
+3 secciones (sidebar):
+
+1. **🏠 Dashboard**: KPIs, equity curve (Plotly), posiciones abiertas, últimos trades, runs recientes
+2. **📋 Histórico de trades**: tabla con filtros (símbolo, status, límite), exportar CSV, stats agregadas
+3. **🤖 Acciones de agentes**: timeline con todos los eventos de un run (THOUGHT, TOOL_CALL, TOOL_RESULT, MESSAGE, DECISION)
 
 ---
 
 ## Docker
 
-### Build y corrida única
-
 ```bash
-docker build -t smartbox-trading .
-docker run --rm --env-file .env \
-  -v "$(pwd)/src/data_loader:/app/data_loader" \
-  -v "$(pwd)/logs:/app/logs" \
-  smartbox-trading
+# Build
+docker compose build
+
+# Bot (corrida única)
+docker compose up bot
+
+# Bot + UI (background)
+docker compose up -d bot ui
+
+# Solo UI (si bot ya corrió y dejó datos en ./data)
+docker compose up -d ui
+# → http://localhost:8501
 ```
 
-### Con Docker Compose (recomendado)
-
-```bash
-docker compose up --build
-```
-
-El `docker-compose.yml` monta los volúmenes de caché de parquets (`data_loader/`) y `logs/` para que la información persista entre corridas y para no descargar de cero los datos de Volume Profile cada día.
-
-### Variables clave en el contenedor
-
-El `Dockerfile` ya fija:
-
-```
-TZ=America/New_York
-DATA_LOADER_PATH=/app/data_loader
-VP_LOADER_PATH=/app/data_loader/vp
-LOG_DIR=/app/logs
-```
-
-Si necesitas otra TZ, pásala con `docker run -e TZ=...` o sobreescríbela en `docker-compose.yml`.
+Los volúmenes `./data` (DB + parquet cache) y `./logs` se comparten entre bot y UI.
 
 ---
 
-## Ejecución programada
-
-El contenedor (o el script local) hace **una sola corrida** y termina; la recurrencia se delega al sistema.
-
-### Linux / Mac — cron del host invocando Docker
+## Tests
 
 ```bash
-crontab -e
+# Todos los tests
+pytest
+
+# Solo tests de dominio (puros, sin I/O, muy rápidos)
+pytest tests/domain
+
+# Solo tests de regresión (las 22 reglas originales)
+pytest -m regression
+
+# Con coverage
+pytest --cov=src --cov-report=term-missing
 ```
 
-```cron
-# Lunes a viernes, 7:50 AM hora NY → Docker Compose
-50 7 * * 1-5 cd /ruta/al/proyecto/agents/strategy_ai && /usr/bin/docker compose run --rm bot >> /tmp/smartbox.log 2>&1
+Estructura:
+- `tests/domain/` — 80 tests (puros, sin I/O)
+- `tests/infrastructure/` — 27 tests (DB, adapters)
+- `tests/application/` — 21 tests (agentes, tools)
+- `tests/pipeline/` — 13 tests (stages, contracts)
+
+Total: **141 tests**.
+
+### Lint + format
+
+```bash
+ruff check src/
+ruff format src/
 ```
 
-### Linux / Mac — cron sin Docker
+---
 
-```cron
-50 7 * * 1-5 cd /ruta/al/proyecto/agents/strategy_ai && /ruta/al/.venv/bin/python -m strategy_ai.main >> /tmp/smartbox.log 2>&1
-```
+## Multi-provider LLM
 
-### Windows — Task Scheduler
+Tradeoff recomendado:
 
-Crear `run_strategy.bat`:
-
-```bat
-@echo off
-cd /d "C:\ruta\al\proyecto\agents\strategy_ai"
-call .venv\Scripts\activate
-python -m strategy_ai.main >> logs\strategy.log 2>&1
-```
-
-Luego en **Programador de tareas** crear una tarea diaria a las 7:50 AM apuntando al `.bat`.
-
-> El bot detecta fines de semana internamente (`interval_fecha.is_trading_day`) y aborta limpio.
+| Agente | Provider sugerido | Por qué |
+|---|---|---|
+| `decision_maker` | OpenAI gpt-4o / Anthropic Claude | Necesita razonamiento de alto nivel |
+| `trader` | OpenAI gpt-4o-mini / local | Pattern matching, velocidad > capacidad |
+| `risk_analyst` | OpenAI / DeepSeek | Análisis cuantitativo |
+| `mtfa` | **Ollama local** | Análisis técnico, no necesita nube |
+| `position_manager` | OpenAI gpt-4o-mini | Lógica de gestión, baja latencia |
 
 ---
 
@@ -258,98 +336,47 @@ Luego en **Programador de tareas** crear una tarea diaria a las 7:50 AM apuntand
 
 ```
 agents/strategy_ai/
+├── pyproject.toml
 ├── Dockerfile
 ├── docker-compose.yml
-├── pyproject.toml              # configuración de paquete + scripts
-├── requirements.txt            # mirror de dependencias (instalación pip puro)
-├── .env.exmple                 # plantilla — copiar a .env
+├── .env.exmple
+├── README.md
 ├── src/
-│   ├── broker_api/             # Login y órdenes (Capital + SimpleFX)
-│   │   ├── login.py
-│   │   ├── api_requests.py
-│   │   └── make_order.py
-│   ├── preprocess/             # Pipeline de datos
-│   │   ├── process_pipeline.py # Caja + RSI + VP + caché parquet
-│   │   └── breakout_monitor.py # Monitor post-caja (live/histórico)
-│   ├── tools_bot/              # Cálculos puros
-│   │   ├── box.py
-│   │   ├── utils_trading_rsi.py
-│   │   ├── utils_trading_vp.py
-│   │   ├── time_now.py
-│   │   ├── interval_fecha.py
-│   │   └── standar_data.py
-│   ├── strategy_ai/            # CrewAI
-│   │   ├── main.py             # orquestador
-│   │   ├── crew.py             # 3 agentes + after_kickoff (órdenes)
-│   │   ├── config/
-│   │   │   ├── agents.yaml
-│   │   │   └── tasks.yaml
-│   │   └── tools/              # tools del crew (scraping, summarize, analyze)
-│   ├── utils/
-│   │   ├── logger.py
-│   │   ├── safety/env_validator.py
-│   │   └── retry.py
-│   └── data_loader/            # caché de parquets (montable como volumen)
-│       └── vp/
+│   ├── domain/              # Capas puras
+│   ├── application/         # Use cases + agents
+│   ├── infrastructure/      # DB, broker, LLM
+│   ├── pipeline/            # Orchestrator
+│   ├── interfaces/          # CLI + UI
+│   ├── broker_api/          # (legacy compatible)
+│   ├── preprocess/          # (legacy compatible)
+│   ├── strategy_ai/         # (legacy compatible)
+│   ├── tools_bot/           # (legacy compatible)
+│   ├── utils/               # logger, retry
+│   └── data_loader/         # parquet cache
 ├── tests/
-└── logs/
+│   ├── domain/
+│   ├── infrastructure/
+│   ├── application/
+│   ├── pipeline/
+│   └── conftest.py
+├── data/                    # SQLite + parquet (gitignored)
+└── logs/                    # strategy.log (gitignored)
 ```
-
----
-
-## Variables de entorno
-
-### Requeridas (validadas al arranque)
-
-| Variable | Descripción |
-|---|---|
-| `EMAIL`, `PASSWORD`, `API_KEY` | Credenciales Capital.com |
-| `ID`, `KEY`, `SIMPLE_ACCOUNT` | Credenciales SimpleFX |
-| `OPENAI_API_KEY` | API key OpenAI |
-| `SYMBOLS` | Lista CSV de instrumentos (`US500,US100`) |
-| `TIMEFRAME` | Resolución Capital (`MINUTE_5`, `MINUTE_15`, …) |
-| `START_VP`, `END_VP` | Rango ISO del Volume Profile (debe contener la caja) |
-
-### Opcionales con default
-
-| Variable | Default | Descripción |
-|---|---|---|
-| `PRIMARY_SYMBOL` | `US500` | Símbolo de referencia; el bot espera su breakout antes del veredicto final |
-| `BOX_START`, `BOX_END` | `08:00`, `09:55` | Ventana de la caja (UTC, según .env) |
-| `BOX_DATE` | hoy | Fecha de la caja `YYYY-MM-DD` |
-| `MARKET_TZ` | `America/New_York` | TZ del mercado |
-| `VOLUME` | `1.0` | Volumen base; se divide 50/50 entre las dos órdenes |
-| `MAX_ORDERS_PER_DAY` | `4` | Hard cap de órdenes enviadas en una corrida |
-| `MIN_RR_RATIO` | `1.5` | R:R mínimo para no descartar la operación |
-| `MIN_CONFIDENCE` | `0` | Confianza mínima del crew (0–100) |
-| `SIMPLE_REALITY` | `Demo` | `DEMO` o `LIVE` |
-| `DRY_RUN` | `false` | Si `true`, **no** se envían órdenes al broker |
-| `LOG_LEVEL` | `INFO` | Nivel de logging |
-| `LOG_DIR` | `./logs` (cwd) | Dónde escribir `strategy.log` rotativo. Si no es escribible, se usa solo stdout. |
-| `DATA_LOADER_PATH` | `src/data_loader` | Dónde escribir parquets (útil para volúmenes Docker) |
-| `VP_LOADER_PATH` | `${DATA_LOADER_PATH}/vp` | Parquets de 1-min para Volume Profile |
 
 ---
 
 ## Descargo de responsabilidad
 
 > **ADVERTENCIA**
-
-- El trading de instrumentos financieros conlleva un **alto nivel de riesgo** y puede no ser adecuado para todos los inversores.
-- **Puedes perder parte o la totalidad de tu capital invertido.**
-- Los resultados pasados **no garantizan** resultados futuros.
-- El autor **no es un asesor financiero registrado** y no proporciona asesoramiento de inversión.
-- **Tú eres el único responsable** de tus decisiones de trading.
-- Antes de operar con dinero real:
-  - Practica con una **cuenta demo** durante al menos 1 mes (`SIMPLE_REALITY=DEMO`, `DRY_RUN=true`).
-  - Comprende completamente la estrategia y sus riesgos.
-  - Consulta con un **asesor financiero profesional**.
-  - Establece límites de pérdida que puedas asumir.
-
-**Al usar este software, aceptas que lo haces bajo tu propio riesgo y responsabilidad.**
+>
+> - El trading de instrumentos financieros conlleva un **alto nivel de riesgo** y puede no ser adecuado para todos los inversores.
+> - **Puedes perder parte o la totalidad de tu capital invertido.**
+> - Los resultados pasados **no garantizan** resultados futuros.
+> - El autor **no es un asesor financiero registrado**.
+> - Antes de operar con dinero real, practica con cuenta demo (`SIMPLE_REALITY=DEMO`, `DRY_RUN=true`) durante al menos 1 mes.
 
 ---
 
 ## Licencia
 
-Ver [`LICENSE`](LICENSE).
+Ver `LICENSE`.

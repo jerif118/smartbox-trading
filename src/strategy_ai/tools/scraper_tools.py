@@ -6,6 +6,7 @@ These tools perform REAL actions - web scraping, searching.
 
 import json
 import os
+
 import requests
 from crewai.tools import BaseTool
 

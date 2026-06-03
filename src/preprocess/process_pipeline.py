@@ -1,16 +1,18 @@
 import os
-import pandas as pd
 from dataclasses import dataclass
-from broker_api.login import sesion_capitalcom
+
+import pandas as pd
+from dotenv import load_dotenv
+
 from broker_api.api_requests import price_capital, price_simple
-from tools_bot.interval_fecha import date_ranges, filter_market_hours, _unix_to_dt
-from tools_bot.time_now import unix_time, _unix_to_iso
+from broker_api.login import sesion_capitalcom
 from tools_bot.box import box_strategy
+from tools_bot.interval_fecha import _unix_to_dt, date_ranges, filter_market_hours
+from tools_bot.standar_data import standar_data
+from tools_bot.time_now import _unix_to_iso, unix_time
 from tools_bot.utils_trading_rsi import rsi
 from tools_bot.utils_trading_vp import vp_features_compose
-from tools_bot.standar_data import standar_data
 from utils.logger import get_logger
-from dotenv import load_dotenv
 
 load_dotenv()
 log = get_logger(__name__)

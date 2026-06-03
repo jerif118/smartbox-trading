@@ -1,7 +1,7 @@
 # =============================================================================
-# TASKS YAML - Simplified crew workflow
-# 3 agents: decision_maker (manager) + trader + risk_analyst (workers)
-# Communication via CrewAI task delegation, not fake debate tools
+# TASKS YAML - Crew workflow (5 agents)
+# Flow: prepare_macro → multi_timeframe_check → analyze_pattern → evaluate_risk → final_decision
+# Plus manage_open_positions (always runs, no dependency on breakout)
 # =============================================================================
 
 prepare_macro:

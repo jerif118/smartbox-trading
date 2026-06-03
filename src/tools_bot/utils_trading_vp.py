@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 
+
 def build_vp_ohlc(df, n_bins=1000, body_w=0.70):
     pmin, pmax = df["low"].min(), df["high"].max()
     if not np.isfinite(pmin) or not np.isfinite(pmax) or pmax <= pmin:
@@ -101,7 +102,7 @@ def find_peaks_simple(centers, vp, smooth=5, min_sep_bins=10, thr_q=0.85):
 
 
 def vp_features_compose(df:pd.DataFrame , fecha_inicio:str, freq:str="1H", n_bins:int=1000, body_w:float=0.70, va_pct:float=0.70):
-    
+
     df = df.copy()
     df["dt"] = pd.to_datetime(df["time"], unit="s", utc=True)
 
@@ -111,11 +112,11 @@ def vp_features_compose(df:pd.DataFrame , fecha_inicio:str, freq:str="1H", n_bin
 
     if df.empty:
         return None
-    
+
     centers, vp = build_vp_ohlc(df, n_bins=n_bins, body_w=body_w)
     if centers is None:
         return None
-    
+
     poc, val, vah = value_area(centers, vp, pct=va_pct)
 
     peaks = find_peaks_simple(centers, vp, smooth=7, min_sep_bins=15, thr_q=0.85)
@@ -128,4 +129,3 @@ def vp_features_compose(df:pd.DataFrame , fecha_inicio:str, freq:str="1H", n_bin
         "peaks": peaks
     }
 
-    

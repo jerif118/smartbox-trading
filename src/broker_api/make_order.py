@@ -1,5 +1,5 @@
-import uuid
 import requests
+
 from utils.logger import get_logger
 from utils.retry import retry
 

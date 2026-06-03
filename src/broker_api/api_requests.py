@@ -1,12 +1,13 @@
-import requests
 import pandas as pd
+import requests
+
 from utils.logger import get_logger
 from utils.retry import retry
 
 log = get_logger(__name__)
 
 SIMPLE_BASE = "https://rest.simplefx.com"
-SIMPLE_URL = "https://candles-core.simplefx.com" 
+SIMPLE_URL = "https://candles-core.simplefx.com"
 CAPITAL_URL = "https://api-capital.backend-capital.com"
 
 
