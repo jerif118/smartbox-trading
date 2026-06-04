@@ -16,7 +16,7 @@ dependencies = [
     "pydantic-settings>=2.0",
     "streamlit>=1.32",
     "plotly>=5.18",
-    "streamlit-autorefresh>=1.0.3",
+    "streamlit-autorefresh>=1.0.0",
     "beautifulsoup4>=4.12",
     "lxml>=5.0",
     "colorlog>=6.7",
@@ -32,7 +32,7 @@ dev = [
 ]
 
 [project.scripts]
-smartbox = "interfaces.cli.main:app"
+smartbox = "interfaces.cli.main:main"
 smartbox_ui = "interfaces.streamlit.app:main"
 
 [build-system]
