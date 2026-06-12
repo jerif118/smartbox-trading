@@ -46,16 +46,8 @@ packages = [
     "src/infrastructure",
     "src/pipeline",
     "src/interfaces",
-    "src/broker_api",
-    "src/preprocess",
-    "src/strategy_ai",
-    "src/tools_bot",
     "src/utils",
 ]
-
-[tool.hatch.build.targets.wheel.force-include]
-"src/strategy_ai/config/agents.yaml" = "strategy_ai/config/agents.yaml"
-"src/strategy_ai/config/tasks.yaml"  = "strategy_ai/config/tasks.yaml"
 
 [tool.crewai]
 type = "crew"
