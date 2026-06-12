@@ -10,19 +10,19 @@ from __future__ import annotations
 
 from infrastructure.broker.simplefx.adapter import SimpleFXAdapter
 from infrastructure.persistence.sqlite import event_repo, trade_repo
-from pipeline.contracts import ManageAction, ManageInput, ManageOutput
+from pipeline.contracts import ManageAction, ManageInput, ManageOutput, OpenTradeContract
 from utils.logger import get_logger
 
 log = get_logger(__name__)
 
 
-def _compute_r_multiple(trade: dict, current_price: float) -> float | None:
+def _compute_r_multiple(trade: OpenTradeContract, current_price: float) -> float | None:
     """Calcula R-multiple actual del trade."""
-    entry = trade.get("entry_price", 0)
-    sl = trade.get("stop_loss", 0)
+    entry = trade.entry_price
+    sl = trade.stop_loss
     if not entry or not sl or entry == sl:
         return None
-    if trade["side"] == "BUY":
+    if trade.side == "BUY":
         return (current_price - entry) / (entry - sl)
     return (entry - current_price) / (sl - entry)
 
@@ -35,7 +35,7 @@ def stage_manage(
     """Gestiona trades abiertos. SL a BE en +1R, trailing en +2R."""
     actions: list[ManageAction] = []
     for trade in input_data.open_trades:
-        symbol = trade["symbol"]
+        symbol = trade.symbol
         current = input_data.current_prices.get(symbol)
         if current is None:
             continue
@@ -44,11 +44,11 @@ def stage_manage(
         if r is None:
             continue
 
-        entry = trade["entry_price"]
-        sl = trade["stop_loss"]
-        side = trade["side"]
-        is_runner = bool(trade.get("is_runner", 0))
-        trade_id = trade["id"]
+        entry = trade.entry_price
+        sl = trade.stop_loss
+        side = trade.side
+        is_runner = trade.is_runner
+        trade_id = trade.id
 
         action = ManageAction(
             trade_id=trade_id,
@@ -77,10 +77,10 @@ def stage_manage(
         if action.action != "HOLD" and new_sl is not None:
             try:
                 # Solo modificar si el nuevo SL es MEJOR que el actual
-                current_sl = trade.get("stop_loss", 0)
+                current_sl = trade.stop_loss or 0
                 if (side == "BUY" and new_sl > current_sl) or (side == "SELL" and new_sl < current_sl):
                     broker.modify_order(
-                        trade["broker_order_id"],
+                        trade.broker_order_id,
                         stop_loss=new_sl,
                     )
                     trade_repo.modify_sl_tp(trade_id, stop_loss=new_sl)

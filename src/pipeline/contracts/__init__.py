@@ -7,9 +7,10 @@ que un stage solo recibe lo que el stage anterior garantiza.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+import pandas as pd
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from domain.strategy.box import Box
 from domain.strategy.decision import Action, RiskMode
@@ -24,8 +25,10 @@ class IngestInput(BaseModel):
 
 
 class IngestOutput(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     symbol: str
-    df_candles: Any  # pd.DataFrame (no se puede serializar, lo pasamos como objeto)
+    df_candles: pd.DataFrame  # no serializable; se pasa como objeto
     n_candles: int
 
 
@@ -67,8 +70,10 @@ class ContextOutput(BaseModel):
 
 # ── Stage 4: Signal (breakout) ────────────────────────────────────────
 class SignalInput(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     symbol: str
-    df_candles: Any  # pd.DataFrame
+    df_candles: pd.DataFrame
     box: Box
     primary: bool = False
 
@@ -82,8 +87,34 @@ class SignalOutput(BaseModel):
 
 
 # ── Stage 5: Analyze (crew) ───────────────────────────────────────────
+class BreakoutSignalData(BaseModel):
+    state: Literal["ABOVE", "BELOW", "INSIDE", "NONE"]
+    close: float | None = None
+    time: str | None = None
+
+
+class BoxLevelsData(BaseModel):
+    high: float
+    low: float
+    mid: float
+    amp_pct: float
+
+
+class SymbolCrewData(BaseModel):
+    """Datos de un símbolo con breakout, listos para el crew."""
+
+    symbol: str
+    is_primary: bool = False
+    market_tz: str = "America/New_York"
+    breakout_signal: BreakoutSignalData
+    caja: BoxLevelsData
+    vp: dict = Field(default_factory=dict)
+    rsi: dict = Field(default_factory=dict)
+    macro: dict = Field(default_factory=dict)
+
+
 class AnalyzeInput(BaseModel):
-    symbols: list[dict]  # cada uno con box, signal, contexto
+    symbols: list[SymbolCrewData] = Field(min_length=1)
     market: str = "S&P 500"
 
 
@@ -93,6 +124,8 @@ class DecisionContract(BaseModel):
     risk: RiskMode
     confidence: int = Field(ge=0, le=100)
     reasons: list[str] = Field(min_length=1)
+    # key_levels/signal quedan como dict deliberadamente: son output del LLM
+    # (con fallback) y su estructura interna no es contractual.
     key_levels: dict
     signal: dict
     team_consensus: str
@@ -140,8 +173,23 @@ class ExecuteOutput(BaseModel):
 
 
 # ── Stage 7: Manage (position manager) ────────────────────────────────
+class OpenTradeContract(BaseModel):
+    """Fila de trade abierto desde SQLite. extra='allow' tolera columnas nuevas."""
+
+    model_config = ConfigDict(extra="allow")
+
+    id: int
+    symbol: str
+    side: Literal["BUY", "SELL"]
+    entry_price: float
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    is_runner: bool = False
+    broker_order_id: str | None = None
+
+
 class ManageInput(BaseModel):
-    open_trades: list[dict]  # de SQLite
+    open_trades: list[OpenTradeContract]
     current_prices: dict[str, float]  # symbol -> price
 
 

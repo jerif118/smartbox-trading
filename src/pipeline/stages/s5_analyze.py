@@ -25,12 +25,16 @@ def stage_analyze(
     """Corre el crew. Retorna decisiones estructuradas."""
     settings = get_settings()
 
+    # El crew consume dicts JSON-serializables
+    symbols = [s.model_dump() for s in input_data.symbols]
+    symbol_names = [s["symbol"] for s in symbols]
+
     # Log inicio
     event_repo.log_event(
         run_id=run_id,
         agent="decision_maker",
         event_type="SYSTEM",
-        payload={"stage": "analyze", "symbols": [s["symbol"] for s in input_data.symbols]},
+        payload={"stage": "analyze", "symbols": symbol_names},
     )
 
     # Tareas (simplificadas — los detalles de cada tool ya están en los agentes)
@@ -38,7 +42,7 @@ def stage_analyze(
 
     prep_task = Task(
         description=(
-            f"Para los símbolos {[s['symbol'] for s in input_data.symbols]}, "
+            f"Para los símbolos {symbol_names}, "
             f"scrapea el calendario macro y clasifica el riesgo. "
             f"Retorna JSON: {{'macro_risk': 'LOW|MEDIUM|HIGH', 'events': [...]}}"
         ),
@@ -48,7 +52,7 @@ def stage_analyze(
 
     mtfa_task = Task(
         description=(
-            f"Para cada símbolo {[s['symbol'] for s in input_data.symbols]}, "
+            f"Para cada símbolo {symbol_names}, "
             f"usa multi_timeframe_analysis para confirmar sesgo HTF. "
             f"Retorna JSON: {{symbol: {{htf_bias, mtf_alignment, veto_recommended}}}}"
         ),
@@ -61,7 +65,7 @@ def stage_analyze(
             f"Para cada símbolo en {market_str}, analiza la caja, RSI, VP, "
             f"y el resultado de MTFA. Propón LONG/SHORT/NO_OPERAR. "
             f"Usa confluence_score. Score < 60 = NO_OPERAR. "
-            f"Input JSON: {json.dumps(input_data.symbols, default=str)}"
+            f"Input JSON: {json.dumps(symbols, default=str)}"
         ),
         agent=agents["trader"],
         expected_output="JSON con proposed_direction, confidence, confluence_factors",
@@ -102,7 +106,7 @@ def stage_analyze(
 
     result = crew.kickoff(
         inputs={
-            "symbols_data": json.dumps(input_data.symbols, default=str),
+            "symbols_data": json.dumps(symbols, default=str),
             "market": input_data.market,
         }
     )
@@ -136,7 +140,7 @@ def stage_analyze(
                     signal={},
                     team_consensus="failed",
                 )
-                for s in input_data.symbols
+                for s in symbols
             ]
         )
 
