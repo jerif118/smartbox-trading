@@ -8,7 +8,7 @@ from domain.indicators.rsi import last_rsi
 from domain.indicators.volume_profile import compute_volume_profile
 from domain.strategy.box import compute_box_from_df
 from pipeline.contracts import PreprocessInput, PreprocessOutput
-from tools_bot.time_now import box_window_unix
+from domain.market_time import box_window_unix
 
 
 def stage_preprocess(input_data: PreprocessInput, df_candles) -> PreprocessOutput:

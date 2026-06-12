@@ -22,6 +22,7 @@ class TradeStatus(str, Enum):
 class RunStatus(str, Enum):
     RUNNING = "running"
     SUCCESS = "success"
+    PARTIAL = "partial"  # terminó con errores no fatales
     FAILED = "failed"
     SKIPPED = "skipped"
 

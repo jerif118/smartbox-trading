@@ -86,7 +86,7 @@ def run_stage(
     def _target() -> None:
         try:
             outcome["value"] = fn(*args, **kwargs)
-        except Exception as e:  # noqa: BLE001 — se traduce y re-lanza en el caller
+        except BaseException as e:  # noqa: BLE001 — se traduce y re-lanza en el caller
             outcome["error"] = e
 
     worker = threading.Thread(target=_target, name=f"stage-{name}", daemon=True)
@@ -102,6 +102,12 @@ def run_stage(
         raise StageTimeoutError(name, msg)
 
     if "error" in outcome:
+        raw_err = outcome["error"]
+        if not isinstance(raw_err, Exception):
+            # SystemExit/KeyboardInterrupt: registrar y propagar sin traducir
+            _persist_metric(run_id, name, "error", started_at, duration_ms,
+                            type(raw_err).__name__, str(raw_err))
+            raise raw_err
         err = translate_exception(name, outcome["error"])
         log.error("Stage %s falló (%s): %s", name, type(err).__name__, err,
                   exc_info=outcome["error"])

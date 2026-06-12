@@ -162,7 +162,8 @@ class RunResult(BaseModel):
     run_id: str
     started_at: str
     finished_at: str | None = None
-    status: Literal["running", "success", "failed", "skipped"]
+    # partial = terminó pero con errores no fatales (algún símbolo/orden falló)
+    status: Literal["running", "success", "partial", "failed", "skipped"]
     decisions_count: int = 0
     orders_sent: int = 0
     errors: list[str] = []

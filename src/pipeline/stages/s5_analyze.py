@@ -110,6 +110,19 @@ def stage_analyze(
     # Extraer decisiones del output
     output = _extract_decisions(result)
     if output is None:
+        # El fallback a NO_OPERAR se mantiene, pero el fallo de parseo
+        # queda visible en logs y en agent_events (antes era silencioso).
+        raw = getattr(result, "raw", str(result))
+        log.error(
+            "Crew no produjo JSON parseable; fallback NO_OPERAR. Raw (500c): %s",
+            raw[:500],
+        )
+        event_repo.log_event(
+            run_id=run_id,
+            agent="decision_maker",
+            event_type="SYSTEM",
+            payload={"event": "parse_error", "raw_truncated": raw[:500]},
+        )
         # Fallback: todas NO_OPERAR
         output = AnalyzeOutput(
             decisions=[
@@ -139,25 +152,27 @@ def stage_analyze(
 
 def _extract_decisions(result) -> AnalyzeOutput | None:
     """Extrae AnalyzeOutput del resultado del crew."""
+    import re
+
+    from pydantic import ValidationError
+
     if hasattr(result, "pydantic") and result.pydantic is not None:
         return result.pydantic
     raw = getattr(result, "raw", str(result))
-    try:
-        import re
-        fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, flags=re.DOTALL)
-        candidates = []
-        if fence:
-            candidates.append(fence.group(1))
-        start = raw.find("{")
-        end = raw.rfind("}") + 1
-        if start >= 0 and end > start:
-            candidates.append(raw[start:end])
-        for cand in candidates:
-            try:
-                data = json.loads(cand)
-                return AnalyzeOutput.model_validate(data)
-            except Exception:
-                continue
-    except Exception as e:
-        log.warning("No se pudo parsear output del crew: %s", e)
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, flags=re.DOTALL)
+    candidates = []
+    if fence:
+        candidates.append(fence.group(1))
+    start = raw.find("{")
+    end = raw.rfind("}") + 1
+    if start >= 0 and end > start:
+        candidates.append(raw[start:end])
+    for cand in candidates:
+        try:
+            data = json.loads(cand)
+            return AnalyzeOutput.model_validate(data)
+        except json.JSONDecodeError as e:
+            log.warning("Candidato JSON del crew inválido: %s", e)
+        except ValidationError as e:
+            log.warning("JSON del crew no cumple AnalyzeOutput: %s", e)
     return None

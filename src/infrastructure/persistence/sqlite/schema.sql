@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY,
   started_at TEXT NOT NULL,
   finished_at TEXT,
-  status TEXT NOT NULL,                    -- running | success | failed | skipped
+  status TEXT NOT NULL,                    -- running | success | partial | failed | skipped
   error TEXT,
   config_snapshot TEXT,                    -- JSON de las settings relevantes
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
