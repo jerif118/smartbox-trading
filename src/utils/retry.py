@@ -11,6 +11,7 @@ def retry(
     backoff: float = 2.0,
     initial_delay: float = 1.0,
     exceptions: tuple = (Exception,),
+    max_delay: float = 30.0,
 ):
     def decorator(func):
         @functools.wraps(func)
@@ -29,7 +30,7 @@ def retry(
                         func.__name__, attempt, max_retries + 1, e, delay,
                     )
                     time.sleep(delay)
-                    delay *= backoff
+                    delay = min(delay * backoff, max_delay)
             log.error(
                 "%s agotó %d intentos. Último error: %s",
                 func.__name__, max_retries + 1, last_exc,

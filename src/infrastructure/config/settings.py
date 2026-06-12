@@ -165,6 +165,12 @@ class Settings(BaseSettings):
     dry_run: bool = Field(default=True, alias="DRY_RUN")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
+    # ── Timeouts del pipeline (segundos) ──────────────────────────────────
+    # stage_timeout_s aplica a stages de datos/broker; analyze_timeout_s al
+    # crew de agentes (stage 5), que legítimamente tarda mucho más.
+    stage_timeout_s: int = Field(default=300, alias="STAGE_TIMEOUT_S", ge=10)
+    analyze_timeout_s: int = Field(default=1800, alias="ANALYZE_TIMEOUT_S", ge=60)
+
     # ── Persistencia ──────────────────────────────────────────────────────
     db_path: str = Field(default="./data/smartbox.db", alias="DB_PATH")
     data_loader_path: str = Field(default="./data/parquet", alias="DATA_LOADER_PATH")
