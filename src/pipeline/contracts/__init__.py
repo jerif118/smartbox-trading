@@ -103,12 +103,20 @@ class AnalyzeOutput(BaseModel):
 
 
 # ── Stage 6: Execute ──────────────────────────────────────────────────
+def _today_utc() -> str:
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC).date().isoformat()
+
+
 class ExecuteInput(BaseModel):
     decision: DecisionContract
     symbol: str
     box: Box
     base_volume: float
     min_rr: float = 1.0
+    # Fecha de trading (UTC) usada en el client_order_id idempotente.
+    trade_date: str = Field(default_factory=_today_utc)
 
 
 class OrderContract(BaseModel):
@@ -127,6 +135,8 @@ class ExecuteOutput(BaseModel):
     decision_id: int
     orders: list[OrderContract]
     errors: list[str] = []
+    # client_order_ids saltados por idempotencia (orden activa ya existente)
+    skipped: list[str] = []
 
 
 # ── Stage 7: Manage (position manager) ────────────────────────────────

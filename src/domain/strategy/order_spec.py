@@ -23,6 +23,16 @@ from domain.strategy.position_sizer import SizedPosition
 Side = Literal["BUY", "SELL"]
 
 
+def make_client_order_id(trade_date: str, symbol: str, side: str, is_runner: bool) -> str:
+    """Clave idempotente de negocio para una orden.
+
+    Determinista por (día, símbolo, lado, primary/runner): un re-run del mismo
+    día genera la misma clave, y el índice único parcial de la DB impide
+    enviar la orden dos veces mientras esté PENDING/OPEN.
+    """
+    return f"{trade_date}:{symbol}:{side}:{'R' if is_runner else 'P'}"
+
+
 @dataclass(frozen=True)
 class OrderSpec:
     """Especificación de una orden individual (sin ejecutar)."""
