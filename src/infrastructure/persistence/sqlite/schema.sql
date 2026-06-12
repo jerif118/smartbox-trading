@@ -1,5 +1,7 @@
 -- SmartBox Trading v2 — Schema SQLite
--- Versionado vía PRAGMA user_version. Migraciones aplicadas en db.py:migrate()
+-- Versionado vía PRAGMA user_version. Migraciones aplicadas en db.py:_migrate()
+-- Este archivo representa el estado FINAL del schema (LATEST_SCHEMA_VERSION).
+-- Cambios sobre DBs existentes van en db.py:_MIGRATIONS, y también aquí.
 
 CREATE TABLE IF NOT EXISTS schema_version (
   version INTEGER PRIMARY KEY,
@@ -56,6 +58,7 @@ CREATE TABLE IF NOT EXISTS trades (
   take_profit REAL,
   is_runner INTEGER NOT NULL DEFAULT 0,    -- 0 = primary, 1 = runner
   broker_order_id TEXT,
+  client_order_id TEXT,                    -- clave idempotente: fecha:símbolo:lado:P|R
   status TEXT NOT NULL,                    -- PENDING | OPEN | CLOSED_TP | CLOSED_SL | CLOSED_MANUAL | EXPIRED | REJECTED
   ts_close TEXT,
   exit_price REAL,
@@ -67,6 +70,12 @@ CREATE TABLE IF NOT EXISTS trades (
   FOREIGN KEY (run_id) REFERENCES runs(id),
   FOREIGN KEY (decision_id) REFERENCES decisions(id)
 );
+
+-- Índice único PARCIAL: bloquea duplicados activos (PENDING/OPEN) con el mismo
+-- client_order_id, pero permite reintentar tras REJECTED/EXPIRED/CLOSED_*.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_client_order_id_active
+  ON trades(client_order_id)
+  WHERE client_order_id IS NOT NULL AND status IN ('PENDING', 'OPEN');
 
 CREATE INDEX IF NOT EXISTS idx_trades_run_id ON trades(run_id);
 CREATE INDEX IF NOT EXISTS idx_trades_decision_id ON trades(decision_id);
@@ -91,6 +100,23 @@ CREATE INDEX IF NOT EXISTS idx_agent_events_run_id ON agent_events(run_id);
 CREATE INDEX IF NOT EXISTS idx_agent_events_agent ON agent_events(agent);
 CREATE INDEX IF NOT EXISTS idx_agent_events_type ON agent_events(event_type);
 CREATE INDEX IF NOT EXISTS idx_agent_events_ts ON agent_events(ts);
+
+-- ── Stage metrics: duración y resultado de cada stage por run ─────
+CREATE TABLE IF NOT EXISTS stage_metrics (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL,
+  stage TEXT NOT NULL,                     -- ej. s1_ingest:US500, s5_analyze
+  status TEXT NOT NULL,                    -- ok | error | timeout
+  started_at TEXT NOT NULL,
+  duration_ms INTEGER NOT NULL,
+  error_type TEXT,
+  error_msg TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (run_id) REFERENCES runs(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_stage_metrics_run_id ON stage_metrics(run_id);
+CREATE INDEX IF NOT EXISTS idx_stage_metrics_stage ON stage_metrics(stage);
 
 -- ── Equity snapshots: P&L acumulado en el tiempo ──────────────────
 CREATE TABLE IF NOT EXISTS equity_snapshots (

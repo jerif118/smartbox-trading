@@ -25,8 +25,13 @@ def insert_trade(
     decision_id: int | None = None,
     broker_order_id: str | None = None,
     status: str = TradeStatus.PENDING.value,
+    client_order_id: str | None = None,
 ) -> int:
-    """Inserta un trade. Retorna el id."""
+    """Inserta un trade. Retorna el id.
+
+    Lanza sqlite3.IntegrityError si ya existe un trade activo (PENDING/OPEN)
+    con el mismo client_order_id (índice único parcial).
+    """
     ts = _now()
     with get_db() as conn:
         cur = conn.execute(
@@ -34,13 +39,13 @@ def insert_trade(
             INSERT INTO trades (
                 run_id, decision_id, ts_open, symbol, side, volume,
                 entry_price, stop_loss, take_profit, is_runner,
-                broker_order_id, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                broker_order_id, status, client_order_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id, decision_id, ts, symbol, side, volume,
                 entry_price, stop_loss, take_profit, 1 if is_runner else 0,
-                broker_order_id, status,
+                broker_order_id, status, client_order_id,
             ),
         )
     return int(cur.lastrowid)
@@ -144,6 +149,39 @@ def list_open_trades() -> list[Trade]:
 
 def list_pending_trades() -> list[Trade]:
     return list_trades(status=TradeStatus.PENDING.value, limit=500)
+
+
+def find_active_by_client_order_id(client_order_id: str) -> Trade | None:
+    """Busca un trade activo (PENDING/OPEN) con ese client_order_id.
+
+    Es el chequeo de idempotencia previo a enviar una orden al broker.
+    """
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM trades WHERE client_order_id = ? "
+            "AND status IN ('PENDING', 'OPEN') LIMIT 1",
+            (client_order_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    d = dict(row)
+    d["is_runner"] = bool(d.get("is_runner", 0))
+    return Trade(**d)
+
+
+def count_orders_today() -> int:
+    """Órdenes enviadas hoy (UTC), excluyendo rechazadas.
+
+    Siembra el DailyOrderBudget para que MAX_ORDERS_PER_DAY sobreviva re-runs.
+    """
+    today = datetime.now(UTC).date().isoformat()
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM trades "
+            "WHERE DATE(ts_open) = ? AND status != 'REJECTED'",
+            (today,),
+        ).fetchone()
+    return int(row[0])
 
 
 def realized_pnl_today() -> float:

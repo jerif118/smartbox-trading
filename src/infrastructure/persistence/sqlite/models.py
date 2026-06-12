@@ -49,6 +49,7 @@ class Trade:
     take_profit: float | None = None
     is_runner: bool = False
     broker_order_id: str | None = None
+    client_order_id: str | None = None
     status: str = TradeStatus.PENDING.value
     ts_close: str | None = None
     exit_price: float | None = None
