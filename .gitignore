@@ -13,6 +13,8 @@ src/data_loader/*.parquet
 src/data_loader/vp/*.parquet
 data/
 *.db
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
 logs/
