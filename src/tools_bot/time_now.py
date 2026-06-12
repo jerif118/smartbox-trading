@@ -16,6 +16,14 @@ def unix_time(start_:str, end_: str):
     end = pd.to_datetime(end_, utc=True)
     return(int(start.timestamp()),int(end.timestamp()))
 
+
+def box_window_unix(date_str: str, start_h: str, end_h: str, tz_name: str) -> tuple[int, int]:
+    """Ventana de la caja interpretada en la zona horaria del mercado."""
+    tz = ZoneInfo(tz_name)
+    start = pd.Timestamp(f"{date_str} {start_h}:00", tz=tz)
+    end = pd.Timestamp(f"{date_str} {end_h}:00", tz=tz)
+    return (int(start.timestamp()), int(end.timestamp()))
+
 def _unix_to_iso(ts: int) -> str:
     return datetime.fromtimestamp(ts, tz=UTC).strftime("%Y-%m-%dT%H:%M:%S")
 

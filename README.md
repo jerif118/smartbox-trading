@@ -1,6 +1,6 @@
 # SmartBox Trading v2
 
-> Bot de trading automatizado para índices americanos (S&P 500, NASDAQ, GER40) basado en la estrategia de la "caja de apertura". Analiza el mercado con 5 agentes de IA, ejecuta órdenes en SimpleFX, y te muestra todo en un panel visual.
+> Bot de trading automatizado para índices americanos (S&P 500, NASDAQ, DAX) basado en la estrategia de la "caja de apertura". Analiza el mercado con 5 agentes de IA, ejecuta órdenes en SimpleFX, y te muestra todo en un panel visual.
 
 ---
 
@@ -106,7 +106,7 @@ SIMPLE_ACCOUNT=12345678
 Deberías ver:
 ```
 ✓ OPENAI_API_KEY OK
-✓ 3 símbolo(s) configurado(s): ['US500', 'US100', 'GER40']
+✓ 3 símbolo(s) configurado(s): ['US500', 'US100', 'DE40']
 ✓ Modo: DRY_RUN
 ✓ DB inicializada
 ```
@@ -252,14 +252,16 @@ Programa la tarea en **Programador de tareas** de Windows a las 7:50 AM.
 
 | Variable | Default | Descripción |
 |---|---|---|
-| `SYMBOLS` | `US500,US100,GER40` | Símbolos a operar (CSV) |
+| `SYMBOLS` | `US500,US100,DE40` | Símbolos a operar (CSV) |
 | `PRIMARY_SYMBOL` | `US500` | El bot espera el breakout de este símbolo antes de decidir |
 | `BOX_START` | `08:00` | Inicio de la caja (hora NY) |
 | `BOX_END` | `09:55` | Fin de la caja |
+| `VP_LOOKBACK_DAYS` | `3` | Días de velas a descargar (ventana móvil hasta ahora) |
+| `START_VP`/`END_VP` | _(vacíos)_ | Fechas fijas solo para backtest; vacíos = ventana móvil |
 | `VOLUME` | `1.0` | Volumen base (se divide 50/50 entre 2 órdenes) |
 | `MAX_ORDERS_PER_DAY` | `4` | Hard cap de órdenes por día |
 | `MIN_RR_RATIO` | `1.0` | R:R mínimo (los templates producen 1.0) |
-| `MIN_CONFIDENCE` | `0` | Confianza mínima del crew |
+| `MIN_CONFIDENCE` | `60` | Confianza mínima del crew para enviar órdenes |
 | `DRY_RUN` | `true` | Si `true`, NO envía órdenes |
 | `SIMPLE_REALITY` | `DEMO` | `DEMO` o `LIVE` |
 | `DB_PATH` | `./data/smartbox.db` | Path de la base de datos |
@@ -471,13 +473,11 @@ Si quieres arreglar el venv:
 
 La API key de OpenAI no es válida. Verifica en https://platform.openai.com/api-keys que esté activa y cópiala de nuevo (sin espacios al inicio/final).
 
-### "Error 404 GER40" (Capital.com)
+### "error.not-found.epic" (Capital.com)
 
-GER40 no está disponible en tu cuenta de Capital.com. Quítalo de `SYMBOLS` en `.env`:
-
-```env
-SYMBOLS=US500,US100
-```
+El símbolo no existe como epic en Capital.com (p.ej. el DAX es `DE40`, no `GER40`;
+el bot ya convierte `GER40` → `DE40` automáticamente). Si te pasa con otro símbolo,
+búscalo con el endpoint `/markets?searchTerm=...` y usa ese epic en `SYMBOLS`.
 
 ### "No module named 'strategy_ai'" (durante build de Docker)
 

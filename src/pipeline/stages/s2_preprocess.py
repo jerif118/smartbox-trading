@@ -8,14 +8,16 @@ from domain.indicators.rsi import last_rsi
 from domain.indicators.volume_profile import compute_volume_profile
 from domain.strategy.box import compute_box_from_df
 from pipeline.contracts import PreprocessInput, PreprocessOutput
-from tools_bot.time_now import unix_time
+from tools_bot.time_now import box_window_unix
 
 
 def stage_preprocess(input_data: PreprocessInput, df_candles) -> PreprocessOutput:
     """Calcula features para un símbolo."""
-    box_from, box_to = unix_time(
-        f"{input_data.box_date}T{input_data.box_start}:00",
-        f"{input_data.box_date}T{input_data.box_end}:00",
+    box_from, box_to = box_window_unix(
+        input_data.box_date,
+        input_data.box_start,
+        input_data.box_end,
+        input_data.market_tz,
     )
 
     # Box calculation

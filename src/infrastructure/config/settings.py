@@ -136,9 +136,12 @@ class Settings(BaseSettings):
     box_start: str = Field(default="13:00", alias="BOX_START")
     box_end: str = Field(default="14:55", alias="BOX_END")
 
-    # ── Volume Profile ────────────────────────────────────────────────────
-    start_vp: str = Field(default="2026-02-12T00:00:00", alias="START_VP")
-    end_vp: str = Field(default="2026-02-18T14:55:00", alias="END_VP")
+    # ── Volume Profile / ventana de datos ─────────────────────────────────
+    # START_VP/END_VP fijos solo para backtests; vacíos → ventana dinámica
+    # de los últimos VP_LOOKBACK_DAYS días hasta ahora.
+    start_vp: str = Field(default="", alias="START_VP")
+    end_vp: str = Field(default="", alias="END_VP")
+    vp_lookback_days: int = Field(default=3, alias="VP_LOOKBACK_DAYS", ge=1, le=30)
 
     # ── Capital.com ───────────────────────────────────────────────────────
     email: str = Field(default="", alias="EMAIL")
@@ -203,6 +206,21 @@ class Settings(BaseSettings):
     def symbol_list(self) -> list[str]:
         return [s.strip() for s in self.symbols.split(",") if s.strip()]
 
+    def vp_window(self) -> tuple[str, str]:
+        """Ventana de velas (UTC, ISO sin tz) para ingest/VP.
+
+        Si START_VP y END_VP están definidos se respetan (modo backtest);
+        si no, ventana móvil que siempre incluye el día actual.
+        """
+        if self.start_vp and self.end_vp:
+            return self.start_vp, self.end_vp
+        from datetime import UTC, datetime, timedelta
+
+        end = datetime.now(UTC)
+        start = end - timedelta(days=self.vp_lookback_days)
+        fmt = "%Y-%m-%dT%H:%M:%S"
+        return start.strftime(fmt), end.strftime(fmt)
+
     @property
     def is_demo(self) -> bool:
         return self.simple_reality.upper() == "DEMO"
@@ -250,6 +268,4 @@ def has_openai_key() -> bool:
     val = os.getenv("OPENAI_API_KEY", "").strip()
     if not val or val.lower() in placeholder_values:
         return False
-    if not val.startswith("sk-"):
-        return False
-    return True
+    return val.startswith("sk-")

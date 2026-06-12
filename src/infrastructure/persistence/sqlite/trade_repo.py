@@ -146,6 +146,18 @@ def list_pending_trades() -> list[Trade]:
     return list_trades(status=TradeStatus.PENDING.value, limit=500)
 
 
+def realized_pnl_today() -> float:
+    """P&L realizado del día (UTC). Para el freno duro de MAX_DAILY_LOSS."""
+    today = datetime.now(UTC).date().isoformat()
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(pnl), 0) FROM trades "
+            "WHERE pnl IS NOT NULL AND DATE(ts_close) = ?",
+            (today,),
+        ).fetchone()
+    return float(row[0] or 0.0)
+
+
 def compute_stats() -> dict[str, Any]:
     """Métricas agregadas para el dashboard."""
     with get_db() as conn:

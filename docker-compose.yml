@@ -7,9 +7,12 @@
 #
 # El bot corre como "one-shot" (termina tras cada corrida).
 # La UI queda corriendo para ver el dashboard en http://localhost:8501
+#   docker compose up -d ui          # solo el dashboard, sin disparar un run
 #
-# Para correr el bot con cron del host:
-#   50 7 * * 1-5 cd /ruta && docker compose run --rm bot >> /tmp/smartbox.log 2>&1
+# Para correr el bot con cron del host (la señal se busca en las 2h
+# posteriores al cierre de la caja, p.ej. caja 08:00-09:55 NY → corre
+# cada 5 min entre 10:00 y 11:55 NY):
+#   */5 10-11 * * 1-5 cd /ruta && docker compose run --rm bot >> /tmp/smartbox.log 2>&1
 #
 # Para correr el bot periódicamente DENTRO de Docker, descomenta el servicio `scheduler`.
 
@@ -62,8 +65,6 @@ services:
         --browser.gatherUsageStats=false
     ports:
       - "8501:8501"
-    depends_on:
-      - bot
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')"]

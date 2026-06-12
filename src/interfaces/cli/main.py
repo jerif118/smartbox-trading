@@ -57,6 +57,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print(f"  • Símbolos: {settings.symbol_list}")
     print(f"  • Primary: {settings.primary_symbol}")
     print(f"  • DRY_RUN: {settings.dry_run}")
+    start_iso, end_iso = settings.vp_window()
+    print(f"  • Ventana datos (UTC): {start_iso} → {end_iso}")
+    print(f"  • Caja: {settings.box_start}–{settings.box_end} ({settings.market_tz})")
     print(f"  • DB path: {settings.db_path}")
 
     db.init_db()

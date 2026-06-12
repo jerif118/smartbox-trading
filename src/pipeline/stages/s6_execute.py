@@ -53,11 +53,20 @@ def stage_execute(
             event_type="DECISION",
             payload={"symbol": decision.symbol, "action": "NO_OPERAR", "skip": True},
         )
-        return ExecuteOutput(decision_id=0, orders=[], errors=["NO_OPERAR"])
+        # NO_OPERAR es un resultado normal de la estrategia, no un error
+        return ExecuteOutput(decision_id=0, orders=[], errors=[])
 
     # Regla #18
     if decision.confidence < settings.min_confidence:
         errors.append(f"confidence {decision.confidence} < min {settings.min_confidence}")
+        return ExecuteOutput(decision_id=0, orders=[], errors=errors)
+
+    # Freno duro de pérdida diaria (no depende del veto del LLM)
+    pnl_today = trade_repo.realized_pnl_today()
+    if pnl_today <= -settings.max_daily_loss:
+        errors.append(
+            f"daily loss limit: pnl hoy {pnl_today:.2f} <= -{settings.max_daily_loss:.2f}"
+        )
         return ExecuteOutput(decision_id=0, orders=[], errors=errors)
 
     # Regla #1: validar box

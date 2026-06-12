@@ -31,6 +31,7 @@ from pipeline.contracts import (
     AnalyzeInput,
     ContextInput,
     ExecuteInput,
+    IngestInput,
     ManageInput,
     PreprocessInput,
     RunResult,
@@ -43,9 +44,13 @@ from pipeline.stages.s4_signal import stage_signal
 from pipeline.stages.s5_analyze import stage_analyze
 from pipeline.stages.s6_execute import stage_execute
 from pipeline.stages.s7_manage import stage_manage
+from tools_bot.time_now import box_window_unix
 from utils.logger import get_logger
 
 log = get_logger(__name__)
+
+# Regla #6: el breakout se busca solo en las 2h posteriores al cierre de la caja
+BREAKOUT_WINDOW_SECONDS = 2 * 3600
 
 
 def _is_weekend(date_str: str) -> bool:
@@ -138,29 +143,32 @@ def run_pipeline() -> RunResult:
         # ── STAGES 1-4 por símbolo (paralelo) ──────────────────────────
         log.info("STAGES 1-4 · Ingest + Preprocess + Signal (%d símbolos)", len(settings.symbol_list))
         box_date = settings.box_date or today
+        start_iso, end_iso = settings.vp_window()
+        log.info("Ventana de datos (UTC): %s → %s | caja %s %s-%s (%s)",
+                 start_iso, end_iso, box_date, settings.box_start, settings.box_end, settings.market_tz)
         symbols_data: list[dict[str, Any]] = []
-        budgets_by_symbol: dict[str, DailyOrderBudget] = {}
 
         def process_symbol(sym: str) -> dict[str, Any] | None:
             try:
                 # Stage 1
                 ingest_out = stage_ingest(
-                    __import__("pipeline.contracts", fromlist=["IngestInput"]).IngestInput(
+                    IngestInput(
                         symbol=sym,
-                        start_iso=settings.start_vp,
-                        end_iso=settings.end_vp,
+                        start_iso=start_iso,
+                        end_iso=end_iso,
                         timeframe=settings.timeframe,
                     )
                 )
                 if ingest_out.n_candles == 0:
                     log.warning("[ingest] %s: 0 velas", sym)
+                    errors.append(f"{sym}: ingest devolvió 0 velas")
                     return None
 
                 # Stage 2
                 pp_in = PreprocessInput(
                     symbol=sym,
-                    start_iso=settings.start_vp,
-                    end_iso=settings.end_vp,
+                    start_iso=start_iso,
+                    end_iso=end_iso,
                     box_date=box_date,
                     box_start=settings.box_start,
                     box_end=settings.box_end,
@@ -172,10 +180,22 @@ def run_pipeline() -> RunResult:
                     sym, pp_out.box.low, pp_out.box.high, pp_out.box.amplitude_pct, pp_out.rsi_last,
                 )
 
-                # Stage 4
+                # Stage 4 — regla #6: solo velas de las 2h posteriores a la caja
+                _, box_to = box_window_unix(
+                    box_date, settings.box_start, settings.box_end, settings.market_tz
+                )
+                df = ingest_out.df_candles
+                post_box = df[
+                    (df["time"] > box_to)
+                    & (df["time"] <= box_to + BREAKOUT_WINDOW_SECONDS)
+                ]
+                if post_box.empty:
+                    log.info("[signal] %s: sin velas post-caja todavía", sym)
+                    return None
+
                 sig_in = SignalInput(
                     symbol=sym,
-                    df_candles=ingest_out.df_candles,
+                    df_candles=post_box,
                     box=pp_out.box,
                     primary=(sym == settings.primary_symbol),
                 )
@@ -203,6 +223,7 @@ def run_pipeline() -> RunResult:
                 }
             except Exception as e:
                 log.error("[pipeline] %s: ERROR → %s", sym, e, exc_info=True)
+                errors.append(f"{sym}: {e}")
                 return None
 
         with ThreadPoolExecutor(max_workers=len(settings.symbol_list)) as pool:
@@ -215,14 +236,22 @@ def run_pipeline() -> RunResult:
                         symbols_data.append(data)
                 except Exception as e:
                     log.error("[pipeline] %s: %s", result, e)
+                    errors.append(f"{result}: {e}")
 
         if not symbols_data:
-            log.info("[FIN] Sin breakouts detectados")
-            run_repo.finish_run(run_id, "success", "no breakouts")
+            if errors:
+                log.warning("[FIN] Sin señales y con errores: %s", "; ".join(errors))
+                run_repo.finish_run(run_id, "failed", "; ".join(errors)[:500])
+                final_status = "failed"
+            else:
+                log.info("[FIN] Sin breakouts detectados")
+                run_repo.finish_run(run_id, "success", "no breakouts")
+                final_status = "success"
             return RunResult(
                 run_id=run_id, started_at=started_at,
                 finished_at=datetime.now(UTC).isoformat(),
-                status="success",
+                status=final_status,
+                errors=errors,
             )
 
         # ── STAGE 3: Context ───────────────────────────────────────────
@@ -268,7 +297,7 @@ def run_pipeline() -> RunResult:
         # ── STAGE 6: Execute ───────────────────────────────────────────
         log.info("STAGE 6 · Execute")
         budget = DailyOrderBudget(max_orders=settings.max_orders_per_day)
-        for i, decision in enumerate(analyze_out.decisions):
+        for decision in analyze_out.decisions:
             # encontrar el Box del símbolo
             sym_data = next((s for s in symbols_data if s["symbol"] == decision.symbol), None)
             if sym_data is None:
@@ -298,8 +327,8 @@ def run_pipeline() -> RunResult:
         except Exception as e:
             log.warning("No se pudo guardar equity snapshot: %s", e)
 
-        status = "success" if not errors else "success"  # success aunque haya errores parciales
-        run_repo.finish_run(run_id, status)
+        status = "success" if not errors else "partial"
+        run_repo.finish_run(run_id, status, "; ".join(errors)[:500] if errors else None)
         log.info("═" * 60)
         log.info("RUN %s FINALIZADO — status=%s, decisions=%d, orders=%d", run_id, status, decisions_count, orders_sent)
         log.info("═" * 60)

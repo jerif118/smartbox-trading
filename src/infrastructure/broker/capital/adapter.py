@@ -30,6 +30,12 @@ TIMEFRAME_SECONDS = {
     "WEEK": 604800,
 }
 
+# Capital.com usa epics propios; estos alias evitan 404 error.not-found.epic
+EPIC_ALIASES = {
+    "GER40": "DE40",
+    "DAX40": "DE40",
+}
+
 
 @retry(max_retries=3, backoff=2.0, exceptions=(requests.RequestException,))
 def _login(email: str, password: str, api_key: str) -> dict[str, str]:
@@ -120,18 +126,40 @@ class CapitalAdapter:
         max_candles: int = 500,
     ) -> pd.DataFrame:
         tokens = self._get_tokens()
-        from_iso = pd.Timestamp(from_ts, unit="s", tz="UTC").strftime("%Y-%m-%dT%H:%M:%S")
-        to_iso = pd.Timestamp(to_ts, unit="s", tz="UTC").strftime("%Y-%m-%dT%H:%M:%S")
-        prices = _fetch_prices(
-            symbol=symbol,
-            resolution=timeframe,
-            from_iso=from_iso,
-            to_iso=to_iso,
-            max_n=str(max_candles),
-            cst=tokens["CST"],
-            xst=tokens["X-SECURITY-TOKEN"],
+        epic = EPIC_ALIASES.get(symbol, symbol)
+
+        # La API rechaza ventanas de calendario > max*resolution
+        # (error.invalid.max.daterange), así que descargamos por chunks.
+        tf_seconds = TIMEFRAME_SECONDS.get(timeframe, 300)
+        chunk_span = int(max_candles * tf_seconds * 0.9)
+        frames: list[pd.DataFrame] = []
+        chunk_from = from_ts
+        while chunk_from < to_ts:
+            chunk_to = min(chunk_from + chunk_span, to_ts)
+            from_iso = pd.Timestamp(chunk_from, unit="s", tz="UTC").strftime("%Y-%m-%dT%H:%M:%S")
+            to_iso = pd.Timestamp(chunk_to, unit="s", tz="UTC").strftime("%Y-%m-%dT%H:%M:%S")
+            prices = _fetch_prices(
+                symbol=epic,
+                resolution=timeframe,
+                from_iso=from_iso,
+                to_iso=to_iso,
+                max_n=str(max_candles),
+                cst=tokens["CST"],
+                xst=tokens["X-SECURITY-TOKEN"],
+            )
+            df = _standardize(prices)
+            if not df.empty:
+                frames.append(df)
+            chunk_from = chunk_to
+
+        if not frames:
+            return pd.DataFrame()
+        return (
+            pd.concat(frames)
+            .drop_duplicates(subset=["time"])
+            .sort_values("time")
+            .reset_index(drop=True)
         )
-        return _standardize(prices)
 
     def get_current_price(self, symbol: str) -> float | None:
         """Precio actual (última vela de 1min)."""
