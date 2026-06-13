@@ -41,6 +41,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         print("  Edita tu .env o usa `doctor` para diagnosticar", file=sys.stderr)
         return 1
 
+    from utils.env_validator import validate_env
+
+    if not validate_env():
+        print("✗ Validación de entorno fallida — revisa los errores arriba", file=sys.stderr)
+        return 1
+
     print(f"Iniciando run (DRY_RUN={settings.dry_run}, símbolos={settings.symbol_list})")
     result = run_pipeline()
     print(json.dumps(result.model_dump(), indent=2, default=str))
@@ -78,6 +84,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         ("position_manager", settings.llm.position_manager),
     ]:
         print(f"  • {agent:20s} {model}")
+
+    print()
+    print("Credenciales:")
+    problems = settings.validate_credentials()
+    if problems:
+        for p in problems:
+            print(f"  • ✗ {p}")
+    else:
+        print("  • ✓ sin problemas detectados")
 
     print()
     print("Local providers health:")

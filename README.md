@@ -265,14 +265,21 @@ Programa la tarea en **Programador de tareas** de Windows a las 7:50 AM.
 | `DRY_RUN` | `true` | Si `true`, NO envía órdenes |
 | `SIMPLE_REALITY` | `DEMO` | `DEMO` o `LIVE` |
 | `DB_PATH` | `./data/smartbox.db` | Path de la base de datos |
+| `STAGE_TIMEOUT_S` | `300` | Timeout (s) por stage de datos/broker |
+| `ANALYZE_TIMEOUT_S` | `1800` | Timeout (s) del crew de agentes (stage 5) |
 
 ### Persistencia
 
 | Path | Qué guarda |
 |---|---|
-| `./data/smartbox.db` | SQLite (trades, decisiones, runs, eventos) |
+| `./data/smartbox.db` | SQLite (trades, decisiones, runs, eventos, métricas por stage) |
 | `./data/parquet/` | Cache de velas OHLCV (no re-descarga) |
-| `./logs/strategy.log` | Log rotativo (5MB x 5 archivos) |
+| `./logs/strategy.log` | Log rotativo (5MB x 5 archivos), con secretos redactados |
+
+La tabla `stage_metrics` registra duración y resultado (`ok | error | timeout`)
+de cada stage en cada run — útil para ver qué parte del pipeline falla o tarda.
+El schema se versiona con `PRAGMA user_version`; las migraciones se aplican
+solas al arrancar (no hace falta borrar la DB al actualizar).
 
 ### Múltiples modelos de IA (uno por agente)
 
@@ -404,7 +411,7 @@ AGENT_MTFA_MODEL=ollama/llama3.1
 ### Correr tests
 
 ```bash
-# Todos (141 tests)
+# Todos (199 tests)
 ./.venv/bin/python -m pytest tests/
 
 # Solo dominio (puros, sin I/O, ~0.3s)
@@ -429,10 +436,12 @@ AGENT_MTFA_MODEL=ollama/llama3.1
 
 ```
 tests/
-├── domain/          # 80 tests puros (Box, RSI, VP, Decision, OrderSpec)
-├── infrastructure/  # 27 tests (SQLite, adapters)
+├── domain/          # 83 tests puros (Box, RSI, VP, Decision, OrderSpec, market_time)
+├── infrastructure/  # 36 tests (SQLite, migraciones, adapters)
 ├── application/     # 21 tests (agentes, tools)
-└── pipeline/        # 13 tests (stages, contracts)
+├── pipeline/        # 40 tests (stages, contracts, runner, orchestrator, idempotencia)
+├── interfaces/      # 8 tests (CLI)
+└── utils/           # 11 tests (retry, redacción de secretos)
 ```
 
 ### Dependencias de desarrollo
@@ -525,24 +534,25 @@ agents/strategy_ai/
 ├── README.md             ← Este archivo
 │
 ├── src/
-│   ├── domain/           # Reglas puras
+│   ├── domain/           # Reglas puras (+ market_time)
 │   ├── application/      # Use cases + 5 agentes
-│   ├── infrastructure/   # SQLite, brokers, LLM
-│   ├── pipeline/         # 7 stages
+│   ├── infrastructure/   # SQLite (+ migraciones), brokers, LLM
+│   ├── pipeline/         # 7 stages + runner (timeouts/métricas) + errors
 │   ├── interfaces/       # CLI + Streamlit
-│   ├── broker_api/       # (legacy, mantenido)
-│   ├── preprocess/       # (legacy, mantenido)
-│   ├── strategy_ai/      # (legacy, mantenido)
-│   ├── tools_bot/        # (legacy, mantenido)
-│   ├── utils/            # logger, retry
+│   ├── utils/            # logger (redacción de secretos), retry
 │   └── data_loader/      # parquet cache
 │
-├── tests/                # 141 tests
-│   ├── domain/           # 80 tests
-│   ├── infrastructure/   # 27 tests
-│   ├── application/      # 21 tests
-│   └── pipeline/         # 13 tests
+├── legacy/               # Código v1, fuera del paquete (borrar tras validar v2)
 │
+├── tests/                # 199 tests
+│   ├── domain/           # 83 tests
+│   ├── infrastructure/   # 36 tests
+│   ├── application/      # 21 tests
+│   ├── pipeline/         # 40 tests
+│   ├── interfaces/       # 8 tests
+│   └── utils/            # 11 tests
+│
+├── docs/AUDITORIA.md     # Informe de auditoría técnica
 ├── data/                 # SQLite + parquet (gitignored)
 └── logs/                 # strategy.log (gitignored)
 ```
@@ -560,8 +570,11 @@ agents/strategy_ai/
 | Arquitectura | Planos | Pipeline + capas (domain/app/infra) |
 | Config | dict | Pydantic Settings tipado |
 | Contratos | Dict libre | Pydantic en cada stage |
-| Tests | 0 | 141 (22 regresión) |
+| Tests | 0 | 199 (22 regresión) |
 | Lint | Sin config | Ruff configurado |
+| Idempotencia | No (re-run duplicaba órdenes) | `client_order_id` + índice único |
+| Timeouts | No (crew podía colgar el run) | Por stage, configurables |
+| Observabilidad | Logs | Logs + `stage_metrics` por run |
 
 ---
 
