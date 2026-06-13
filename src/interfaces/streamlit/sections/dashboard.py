@@ -73,10 +73,10 @@ def render() -> None:
     with col_right:
         st.subheader("Últimos trades cerrados")
         closed = get_trades_df(limit=20)
-        closed_sorted = closed.sort_values("ts_open", ascending=False).head(10)
-        if closed_sorted.empty:
+        if closed.empty or "ts_open" not in closed.columns:
             st.info("Sin trades cerrados aún")
         else:
+            closed_sorted = closed.sort_values("ts_open", ascending=False).head(10)
             display = closed_sorted[["id", "ts_open", "symbol", "side", "volume", "entry_price", "status", "pnl"]]
             st.dataframe(display, use_container_width=True, hide_index=True)
 
