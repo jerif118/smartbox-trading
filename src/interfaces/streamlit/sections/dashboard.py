@@ -72,7 +72,7 @@ def render() -> None:
 
     with col_right:
         st.subheader("Últimos trades cerrados")
-        closed = get_trades_df(status__in=None, limit=20)  # todos
+        closed = get_trades_df(limit=20)
         closed_sorted = closed.sort_values("ts_open", ascending=False).head(10)
         if closed_sorted.empty:
             st.info("Sin trades cerrados aún")
