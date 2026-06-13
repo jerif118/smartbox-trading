@@ -37,7 +37,8 @@ def _scrape_investing_widget(target_date: str, time_zone: str = "8") -> dict[str
     try:
         resp = requests.get(url, params=params, headers=headers, timeout=15)
         resp.raise_for_status()
-    except Exception as e:
+    except requests.RequestException as e:
+        log.warning("Calendario macro (%s) no disponible: %s", url, e)
         return {"ok": False, "error": str(e), "events": []}
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -112,8 +113,8 @@ class DuckDuckGoNewsAdapter:
             }
             resp = requests.get(url, params=params, headers=headers, timeout=15)
             resp.raise_for_status()
-        except Exception as e:
-            log.warning("DuckDuckGo search failed: %s", e)
+        except requests.RequestException as e:
+            log.warning("DuckDuckGo search (%s) failed: %s", url, e)
             return []
 
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -156,11 +157,10 @@ class NewsAPIAdapter:
                 timeout=10,
             )
             resp.raise_for_status()
-        except Exception as e:
-            log.warning("NewsAPI failed: %s", e)
+            data = resp.json()
+        except (requests.RequestException, ValueError) as e:
+            log.warning("NewsAPI (newsapi.org) failed: %s", e)
             return []
-
-        data = resp.json()
         return [
             {
                 "title": a.get("title", ""),

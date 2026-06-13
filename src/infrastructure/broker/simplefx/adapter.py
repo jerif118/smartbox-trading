@@ -68,7 +68,8 @@ def _place_order(
     )
     resp = requests.post(url, headers=headers, json=body, timeout=20)
     if resp.status_code >= 400:
-        log.error("SimpleFX %d: %s", resp.status_code, resp.text)
+        # truncado: el body de error puede contener datos sensibles del server
+        log.error("SimpleFX %d: %s", resp.status_code, resp.text[:300])
     resp.raise_for_status()
     return resp.json()
 

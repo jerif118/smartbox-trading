@@ -73,8 +73,10 @@ class LLMSettings(BaseSettings):
     openai_compatible_base_url: str = Field(
         default="", alias="OPENAI_COMPATIBLE_BASE_URL"
     )
+    # Sin default "dummy": si se configura base_url sin key, validate_credentials
+    # lo reporta en vez de mandar una key falsa a un servidor desconocido.
     openai_compatible_api_key: str = Field(
-        default="dummy", alias="OPENAI_COMPATIBLE_API_KEY"
+        default="", alias="OPENAI_COMPATIBLE_API_KEY"
     )
 
     @field_validator(
@@ -230,6 +232,52 @@ class Settings(BaseSettings):
     @property
     def is_demo(self) -> bool:
         return self.simple_reality.upper() == "DEMO"
+
+    def validate_credentials(self) -> list[str]:
+        """Chequeos de credenciales que Pydantic no puede expresar por campo.
+
+        Retorna lista de problemas (vacía = OK). Lo invoca env_validator
+        antes de correr el bot.
+        """
+        problems: list[str] = []
+
+        agent_models = (
+            self.llm.decision_maker,
+            self.llm.trader,
+            self.llm.risk_analyst,
+            self.llm.mtfa,
+            self.llm.position_manager,
+        )
+        providers = {m.split("/", 1)[0] for m in agent_models}
+        if "openai_compatible" in providers:
+            if not self.llm.openai_compatible_base_url:
+                problems.append(
+                    "OPENAI_COMPATIBLE_BASE_URL vacío pero hay agentes con provider openai_compatible"
+                )
+            if not self.llm.openai_compatible_api_key:
+                problems.append(
+                    "OPENAI_COMPATIBLE_API_KEY vacío pero hay agentes con provider openai_compatible"
+                )
+
+        if self.simple_reality.upper() not in ("DEMO", "LIVE"):
+            problems.append(f"SIMPLE_REALITY inválido: {self.simple_reality!r} (DEMO o LIVE)")
+
+        if not self.dry_run:
+            missing = [
+                name
+                for name, val in (
+                    ("ID", self.sf_id),
+                    ("KEY", self.sf_key),
+                    ("SIMPLE_ACCOUNT", self.simple_account),
+                )
+                if not val.strip()
+            ]
+            if missing:
+                problems.append(
+                    f"modo LIVE (DRY_RUN=false) requiere credenciales SimpleFX: faltan {missing}"
+                )
+
+        return problems
 
 
 _settings_singleton: Settings | None = None

@@ -8,6 +8,7 @@ Uso:
 
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -15,6 +16,51 @@ _LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 _LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 _INITIALIZED = False
+
+# Env vars cuyos VALORES nunca deben aparecer en un log
+_SECRET_ENV_VARS = (
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GOOGLE_API_KEY",
+    "MISTRAL_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "GROQ_API_KEY",
+    "OPENAI_COMPATIBLE_API_KEY",
+    "PASSWORD",
+    "API_KEY",
+    "KEY",
+    "ID",
+    "NEWS_API_KEY",
+)
+
+_BEARER_RE = re.compile(r"Bearer\s+\S+")
+_REDACTED = "***REDACTED***"
+
+
+class RedactSecretsFilter(logging.Filter):
+    """Enmascara tokens Bearer y valores de env secrets en cada record.
+
+    Se instala en TODOS los handlers del root logger, así cubre también
+    logs de librerías de terceros que pasen por logging estándar.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        # len > 6 evita redactar valores triviales tipo "true" o ids cortos
+        self._secrets = [
+            val for var in _SECRET_ENV_VARS if len(val := os.getenv(var, "").strip()) > 6
+        ]
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        redacted = _BEARER_RE.sub(f"Bearer {_REDACTED}", msg)
+        for secret in self._secrets:
+            if secret in redacted:
+                redacted = redacted.replace(secret, _REDACTED)
+        if redacted != msg:
+            record.msg = redacted
+            record.args = ()
+        return True
 
 
 def _resolve_log_dir() -> Path | None:
@@ -53,11 +99,13 @@ def _init_root():
 
     root = logging.getLogger()
     root.setLevel(getattr(logging, _LOG_LEVEL, logging.INFO))
+    redact = RedactSecretsFilter()
 
     # ── Consola ───────────────────────────────────────────────────
     console = logging.StreamHandler(sys.stdout)
     console.setLevel(logging.DEBUG)
     console.setFormatter(logging.Formatter(_LOG_FORMAT, _DATE_FORMAT))
+    console.addFilter(redact)
     root.addHandler(console)
 
     # ── Archivo rotativo (opcional, no rompe si no hay path escribible) ──
@@ -73,6 +121,7 @@ def _init_root():
         )
         file_h.setLevel(logging.DEBUG)
         file_h.setFormatter(logging.Formatter(_LOG_FORMAT, _DATE_FORMAT))
+        file_h.addFilter(redact)
         root.addHandler(file_h)
     else:
         root.warning(

@@ -48,6 +48,8 @@ def validate_env() -> bool:
     if not settings.symbol_list:
         errors.append("  ✗ SYMBOLS — lista vacía")
 
+    errors.extend(f"  ✗ {p}" for p in settings.validate_credentials())
+
     if errors:
         log.error("Validación FALLIDA:")
         for e in errors:
