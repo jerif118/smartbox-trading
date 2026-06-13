@@ -61,9 +61,11 @@ RUN mkdir -p /app/data/parquet/vp /app/logs \
 
 USER app
 
-# Healthcheck — verifica que el módulo principal importa y doctor funciona
-HEALTHCHECK --interval=5m --timeout=30s --start-period=30s --retries=3 \
-    CMD python -c "from interfaces.cli.main import main; main(['doctor'])" || exit 1
+EXPOSE 8501
 
-# Comando por defecto: doctor (para que el container no falle si se arranca solo)
-CMD ["python", "-m", "interfaces.cli.main", "doctor"]
+# Healthcheck — verifica que Streamlit esté respondiendo
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')" || exit 1
+
+# Comando por defecto: levanta el panel Streamlit en el puerto 8501
+CMD ["streamlit", "run", "src/interfaces/streamlit/app.py", "--server.address=0.0.0.0", "--server.port=8501", "--server.headless=true", "--browser.gatherUsageStats=false"]
