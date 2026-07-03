@@ -19,6 +19,9 @@ def temp_env(monkeypatch, tmp_path):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     monkeypatch.setenv("DRY_RUN", "true")
     monkeypatch.setenv("SYMBOLS", "US500")
+    # Por defecto once para no entrar al loop de monitor (cada test que lo
+    # necesite sobrescribe RUN_MODE). Evita que .env (RUN_MODE=monitor) filtre.
+    monkeypatch.setenv("RUN_MODE", "once")
     reset_settings_cache()
     db.reset_db(db_path)
     db.init_db(db_path)
@@ -100,3 +103,52 @@ def test_run_without_openai_key_exits_1(monkeypatch, capsys):
         assert cli.main(["run", "--dry-run"]) == 1
         mock_run.assert_not_called()
     assert "OPENAI_API_KEY" in capsys.readouterr().err
+
+
+# ── RUN_MODE: once vs monitor ─────────────────────────────────────────
+def test_run_mode_once_runs_pipeline_once(monkeypatch):
+    """RUN_MODE=once → corre el pipeline una vez, NO entra al monitor."""
+    monkeypatch.setenv("RUN_MODE", "once")
+    reset_settings_cache()
+    fake = RunResult(
+        run_id="x", started_at="2026-06-12T12:00:00", finished_at="2026-06-12T12:01:00",
+        status="success",
+    )
+    with patch("pipeline.orchestrator.run_pipeline", return_value=fake) as mock_run, \
+         patch("pipeline.monitor.run_monitor") as mock_monitor:
+        rc = cli.main(["run"])
+    assert rc == 0
+    mock_run.assert_called_once()
+    mock_monitor.assert_not_called()
+
+
+def test_run_mode_monitor_enters_loop(monkeypatch):
+    """RUN_MODE=monitor → entra al monitor, NO corre el pipeline directamente."""
+    monkeypatch.setenv("RUN_MODE", "monitor")
+    reset_settings_cache()
+    with patch("pipeline.orchestrator.run_pipeline") as mock_run, \
+         patch("pipeline.monitor.run_monitor", return_value=3) as mock_monitor:
+        rc = cli.main(["run"])
+    assert rc == 0
+    mock_monitor.assert_called_once()
+    mock_run.assert_not_called()  # el monitor decide cuándo correrlo
+
+
+def test_mode_flag_overrides_run_mode(monkeypatch):
+    """--mode monitor sobrescribe RUN_MODE=once."""
+    monkeypatch.setenv("RUN_MODE", "once")
+    reset_settings_cache()
+    with patch("pipeline.monitor.run_monitor", return_value=0) as mock_monitor:
+        rc = cli.main(["run", "--mode", "monitor"])
+    assert rc == 0
+    mock_monitor.assert_called_once()
+
+
+def test_monitor_subcommand(monkeypatch):
+    """`monitor` es atajo de `run --mode monitor`."""
+    monkeypatch.setenv("RUN_MODE", "once")
+    reset_settings_cache()
+    with patch("pipeline.monitor.run_monitor", return_value=0) as mock_monitor:
+        rc = cli.main(["monitor"])
+    assert rc == 0
+    mock_monitor.assert_called_once()

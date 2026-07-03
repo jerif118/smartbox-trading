@@ -58,7 +58,7 @@ def render() -> None:
         # razones expandible
         st.dataframe(
             display,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "pnl": st.column_config.NumberColumn(format="%.2f"),

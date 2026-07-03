@@ -29,25 +29,51 @@ from utils.logger import get_logger
 log = get_logger(__name__)
 
 
+def _preflight(settings) -> bool:
+    """Chequeos comunes antes de operar. False si algo falla."""
+    if not has_openai_key():
+        print("✗ OPENAI_API_KEY no configurada o es placeholder", file=sys.stderr)
+        print("  Edita tu .env o usa `doctor` para diagnosticar", file=sys.stderr)
+        return False
+    from utils.env_validator import validate_env
+
+    if not validate_env():
+        print("✗ Validación de entorno fallida — revisa los errores arriba", file=sys.stderr)
+        return False
+    return True
+
+
 def cmd_run(args: argparse.Namespace) -> int:
-    """Ejecuta el pipeline completo."""
+    """Ejecuta el pipeline. RUN_MODE/--mode decide once vs monitor."""
     from pipeline.orchestrator import run_pipeline
 
     settings = get_settings()
     if args.dry_run:
         settings.dry_run = True
-    if not has_openai_key():
-        print("✗ OPENAI_API_KEY no configurada o es placeholder", file=sys.stderr)
-        print("  Edita tu .env o usa `doctor` para diagnosticar", file=sys.stderr)
+    mode = args.mode or settings.run_mode
+    if not _preflight(settings):
         return 1
 
-    from utils.env_validator import validate_env
+    print(f"Símbolos activos (filtrados): {settings.symbol_list}")
 
-    if not validate_env():
-        print("✗ Validación de entorno fallida — revisa los errores arriba", file=sys.stderr)
-        return 1
+    if mode == "monitor":
+        from pipeline.monitor import WindowConfig, run_monitor
 
-    print(f"Iniciando run (DRY_RUN={settings.dry_run}, símbolos={settings.symbol_list})")
+        window = WindowConfig.from_settings(settings)
+        print(
+            f"RUN_MODE=monitor | ventana {settings.operate_start}-{settings.operate_end} "
+            f"({settings.market_tz}) cada {settings.monitor_interval_s}s. Ctrl+C para salir."
+        )
+        try:
+            n = run_monitor(run_pipeline, window)
+        except KeyboardInterrupt:
+            print("\nMonitor detenido por el usuario.")
+            return 0
+        print(f"Monitor finalizado tras {n} corrida(s).")
+        return 0
+
+    # mode == "once"
+    print(f"RUN_MODE=once (DRY_RUN={settings.dry_run})")
     result = run_pipeline()
     print(json.dumps(result.model_dump(), indent=2, default=str))
     return 0 if result.status in ("success", "skipped") else 1
@@ -144,9 +170,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="smartbox", description="SmartBox Trading v2")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_run = sub.add_parser("run", help="Ejecuta el pipeline")
+    p_run = sub.add_parser("run", help="Ejecuta el pipeline (once o monitor)")
     p_run.add_argument("--dry-run", action="store_true", help="No envía órdenes al broker")
+    p_run.add_argument(
+        "--mode", choices=["once", "monitor"], default=None,
+        help="Sobrescribe RUN_MODE: once (una vez) o monitor (loop en ventana)",
+    )
     p_run.set_defaults(func=cmd_run)
+
+    p_monitor = sub.add_parser("monitor", help="Atajo de `run --mode monitor`")
+    p_monitor.add_argument("--dry-run", action="store_true", help="No envía órdenes al broker")
+    p_monitor.set_defaults(func=cmd_run, mode="monitor")
 
     p_doctor = sub.add_parser("doctor", help="Diagnóstico del sistema")
     p_doctor.set_defaults(func=cmd_doctor)

@@ -7,12 +7,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from application.agents.agents import (
-    build_all_agents,
-    build_decision_maker,
-    build_mtfa,
+    build_desk_manager,
     build_position_manager,
-    build_risk_analyst,
-    build_trader,
+    build_risk_agent,
+    build_trader_agent,
 )
 from application.agents.tools import (
     AnalyzeBoxTool,
@@ -68,43 +66,46 @@ def test_llm_settings_invalid_format() -> None:
             reset_settings_cache()
 
 
-# ── Construcción de agentes ──────────────────────────────────────────
-def test_build_decision_maker(llm_settings: LLMSettings) -> None:
-    agent = build_decision_maker(llm_settings)
-    assert agent.role is not None
-    assert "orquestador" in agent.role.lower() or "jefe" in agent.role.lower()
+# ── Construcción de agentes (nombres simples, por símbolo) ───────────
+@pytest.mark.parametrize("symbol", ["US500", "US100"])
+def test_build_trader_agent_simple_name(llm_settings: LLMSettings, symbol: str) -> None:
+    agent = build_trader_agent(symbol, llm_settings)
+    assert agent.role == f"Trader_{symbol}"
+    assert agent.allow_delegation is False
 
 
-def test_build_trader(llm_settings: LLMSettings) -> None:
-    agent = build_trader(llm_settings)
-    assert "trader" in agent.role.lower()
+@pytest.mark.parametrize("symbol", ["US500", "US100"])
+def test_build_risk_agent_simple_name(llm_settings: LLMSettings, symbol: str) -> None:
+    agent = build_risk_agent(symbol, llm_settings)
+    assert agent.role == f"Risk_{symbol}"
+    assert agent.allow_delegation is False
 
 
-def test_build_risk_analyst(llm_settings: LLMSettings) -> None:
-    agent = build_risk_analyst(llm_settings)
-    assert "riesgo" in agent.role.lower() or "risk" in agent.role.lower()
+def test_build_desk_manager_no_delegation(llm_settings: LLMSettings) -> None:
+    agent = build_desk_manager(llm_settings)
+    assert agent.role == "Desk_Manager"
+    # El manager final NUNCA delega.
+    assert agent.allow_delegation is False
 
 
-def test_build_mtfa(llm_settings: LLMSettings) -> None:
-    agent = build_mtfa(llm_settings)
-    assert "multi" in agent.role.lower() or "timeframe" in agent.role.lower()
-
-
-def test_build_position_manager(llm_settings: LLMSettings) -> None:
+def test_build_position_manager_simple_name(llm_settings: LLMSettings) -> None:
     agent = build_position_manager(llm_settings)
-    assert "position" in agent.role.lower() or "manager" in agent.role.lower()
+    assert agent.role == "Position_Manager"
+    assert agent.allow_delegation is False
 
 
-def test_build_all_agents(llm_settings: LLMSettings) -> None:
-    agents = build_all_agents(llm_settings)
-    assert set(agents.keys()) == {
-        "decision_maker",
-        "trader",
-        "risk_analyst",
-        "mtfa",
-        "position_manager",
-    }
-    assert len(agents) == 5
+def test_agent_names_have_no_emoji_or_dashes(llm_settings: LLMSettings) -> None:
+    """Los nombres deben ser simples (sin emojis ni guiones largos)."""
+    roles = [
+        build_trader_agent("US500", llm_settings).role,
+        build_risk_agent("US100", llm_settings).role,
+        build_desk_manager(llm_settings).role,
+        build_position_manager(llm_settings).role,
+    ]
+    for role in roles:
+        assert "—" not in role  # em-dash
+        assert "–" not in role  # en-dash
+        assert role.isascii()
 
 
 # ── Tools: funcionalidad pura ────────────────────────────────────────

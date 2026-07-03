@@ -159,7 +159,7 @@ class Settings(BaseSettings):
     # ── Trading ───────────────────────────────────────────────────────────
     volume: float = Field(default=1.0, alias="VOLUME")
     max_orders_per_day: int = Field(default=4, alias="MAX_ORDERS_PER_DAY")
-    min_rr_ratio: float = Field(default=1.5, alias="MIN_RR_RATIO")
+    min_rr_ratio: float = Field(default=1.0, alias="MIN_RR_RATIO")
     min_confidence: int = Field(default=0, alias="MIN_CONFIDENCE", ge=0, le=100)
     max_daily_loss: float = Field(default=500.0, alias="MAX_DAILY_LOSS")
 
@@ -172,6 +172,17 @@ class Settings(BaseSettings):
     # crew de agentes (stage 5), que legítimamente tarda mucho más.
     stage_timeout_s: int = Field(default=300, alias="STAGE_TIMEOUT_S", ge=10)
     analyze_timeout_s: int = Field(default=1800, alias="ANALYZE_TIMEOUT_S", ge=60)
+
+    # ── Modo de ejecución y ventana operativa ─────────────────────────────
+    # once    → corre el pipeline una vez y termina (one-shot, cron externo).
+    # monitor → se mantiene vivo y monitorea dentro de la ventana operativa.
+    run_mode: Literal["once", "monitor"] = Field(default="once", alias="RUN_MODE")
+    # Ventana operativa (hora local de market_tz). Por defecto coincide con la
+    # ventana de breakout (2h posteriores al cierre de la caja 08:00–09:55).
+    operate_start: str = Field(default="10:00", alias="OPERATE_START")
+    operate_end: str = Field(default="12:00", alias="OPERATE_END")
+    # Cada cuánto vuelve a correr el pipeline dentro de la ventana (segundos).
+    monitor_interval_s: int = Field(default=300, alias="MONITOR_INTERVAL_S", ge=10)
 
     # ── Persistencia ──────────────────────────────────────────────────────
     db_path: str = Field(default="./data/smartbox.db", alias="DB_PATH")
@@ -212,7 +223,24 @@ class Settings(BaseSettings):
 
     @property
     def symbol_list(self) -> list[str]:
-        return [s.strip() for s in self.symbols.split(",") if s.strip()]
+        """Símbolos activos, filtrados contra el whitelist (US500/US100).
+
+        Cualquier símbolo extra (DE40, etc.) en SYMBOLS se ignora y loguea.
+        Si tras filtrar no queda ninguno, cae al whitelist completo para no
+        dejar el bot sin nada que analizar.
+        """
+        from domain.symbols import ALLOWED_SYMBOLS, filter_symbols
+
+        raw = [s.strip() for s in self.symbols.split(",") if s.strip()]
+        filtered = filter_symbols(raw, context="settings.SYMBOLS")
+        return filtered or list(ALLOWED_SYMBOLS)
+
+    @property
+    def primary_symbol_resolved(self) -> str:
+        """Símbolo primario garantizado dentro de los símbolos activos."""
+        from domain.symbols import resolve_primary
+
+        return resolve_primary(self.primary_symbol, self.symbol_list)
 
     def vp_window(self) -> tuple[str, str]:
         """Ventana de velas (UTC, ISO sin tz) para ingest/VP.

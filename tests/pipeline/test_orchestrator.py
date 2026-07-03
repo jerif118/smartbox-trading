@@ -68,7 +68,6 @@ def _mock_stages(monkeypatch, analyze_side_effect=None):
     monkeypatch.setattr(orchestrator, "box_window_unix", lambda *a: (0, 1000))
     monkeypatch.setattr(orchestrator, "SimpleFXAdapter", MagicMock())
     monkeypatch.setattr(orchestrator, "CapitalAdapter", MagicMock())
-    monkeypatch.setattr(orchestrator, "build_all_agents", MagicMock(return_value={}))
     monkeypatch.setattr(
         orchestrator, "stage_ingest",
         lambda inp: IngestOutput(symbol=inp.symbol, df_candles=df, n_candles=len(df)),
@@ -207,6 +206,31 @@ def test_weekend_skips(monkeypatch):
     assert result.status == "skipped"
     run = run_repo.get_run(result.run_id)
     assert run.status == "skipped"
+
+
+def test_high_amplitude_symbol_skips_without_failed_run(monkeypatch):
+    analyze_mock, exec_mock = _mock_stages(monkeypatch)
+    wide_box = Box(high=101.03, low=100.0, amplitude_pct=1.03, n_candles=10)
+    signal_mock = MagicMock()
+
+    monkeypatch.setattr(
+        orchestrator, "stage_preprocess",
+        lambda inp, df_c: PreprocessOutput(
+            symbol=inp.symbol, box=wide_box, rsi_last=55.0,
+            volume_profile=None, box_candles=[],
+        ),
+    )
+    monkeypatch.setattr(orchestrator, "stage_signal", signal_mock)
+
+    result = orchestrator.run_pipeline()
+
+    assert result.status == "success"
+    assert result.errors == []
+    signal_mock.assert_not_called()
+    analyze_mock.assert_not_called()
+    exec_mock.assert_not_called()
+    run = run_repo.get_run(result.run_id)
+    assert run.status == "success"
 
 
 def test_symbol_error_without_signals_marks_failed(monkeypatch):

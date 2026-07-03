@@ -1,11 +1,21 @@
 """
-Definición de los 5 agentes del crew.
+Constructores de agentes CrewAI.
 
-- decision_maker: orquestador
-- trader: analiza el setup
-- risk_analyst: escéptico, valida riesgo
-- mtfa: confirma sesgo multi-timeframe (NUEVO)
-- position_manager: gestiona trades abiertos (NUEVO)
+Arquitectura por símbolo (concurrencia segura):
+- Cada símbolo tiene SU PROPIA instancia de Trader y de Risk. Nunca se
+  comparte una instancia de Agent entre dos ramas concurrentes (eso causaba
+  "Executor is already running. Cannot invoke the same executor instance
+  concurrently.").
+- Nombres simples y estables (Trader_US500, Risk_US100, Desk_Manager) sin
+  emojis ni guiones largos, para que CrewAI no falle al resolver coworkers.
+- allow_delegation=False en TODOS los agentes: ningún agente delega. La
+  delegación libre del manager hierarchical era la causa de
+  "coworker mentioned not found".
+
+El Desk_Manager final NO es un agente que delega: la consolidación final es
+determinista (ver pipeline.stages.s5_analyze.consolidate). Se expone igual su
+constructor por si se necesita una narrativa LLM, siempre con
+allow_delegation=False.
 """
 
 from __future__ import annotations
@@ -24,122 +34,91 @@ def _build_agent(role: str, goal: str, backstory: str, llm, tools: list | None =
         llm=llm,
         tools=tools or [],
         verbose=True,
+        # Nadie delega: especialistas y manager final son terminales.
         allow_delegation=False,
     )
 
 
-def build_decision_maker(llm_settings: LLMSettings, tools: list | None = None) -> Agent:
+def build_trader_agent(
+    symbol: str, llm_settings: LLMSettings, tools: list | None = None
+) -> Agent:
+    """Trader aislado para un símbolo concreto. Instancia nueva por rama."""
     return _build_agent(
-        role="Jefe de mesa — orquestador y decisor final",
+        role=f"Trader_{symbol}",
         goal=(
-            "Orquestar el flujo entre trader, risk_analyst, mtfa y position_manager. "
-            "Tienes la palabra final. Si hay conflicto, decides basado en risk_analyst. "
-            "Considera memoria de los últimos runs (drawdown, win rate) para modular el riesgo."
+            f"Analizar el setup de {symbol}: patrón de caja, RSI, Volume Profile "
+            f"(VAH/VAL/POC), breakout y alineación multi-timeframe. Proponer "
+            f"proposed_direction (LONG/SHORT/NO_OPERAR) con un confluence_score "
+            f"cuantitativo 0-100. Si confluence_score < 60 → NO_OPERAR. "
+            f"Listar explícitamente las razones del análisis."
         ),
         backstory=(
-            "15 años liderando equipos de trading quant. No analizas datos directamente — "
-            "orquestas. Consultas a tus especialistas y usas su input. Cuando hay duda, "
-            "vetas. Si vienes de racha perdedora (drawdown semanal > 5%), reduces "
-            "el riesgo por defecto a MEDIO. Si es viernes NY, considera cerrar todo "
-            "antes del cierre por gap risk."
-        ),
-        llm=get_crewai_llm(llm_settings.decision_maker, llm_settings),
-        tools=tools,
-    )
-
-
-def build_trader(llm_settings: LLMSettings, tools: list | None = None) -> Agent:
-    return _build_agent(
-        role="Trader institucional — PRICE ACTION Y PATRONES DE VELA",
-        goal=(
-            "Analizar patrón de caja, proponer dirección (LONG/SHORT/NO_OPERAR), "
-            "identificar confluencia técnica entre RSI, Volume Profile, MTF, "
-            "y patrón de caja. Sin confluencia clara = NO_OPERAR. "
-            "Score cuantitativo de confluencia 0-100."
-        ),
-        backstory=(
-            "15 años analizando mercados. Wyckoff, soportes/resistencias, volumen profile. "
-            "Esperas el setup correcto antes de proponer. Score < 60 → NO_OPERAR. "
-            "Lista explícitamente los factores de confluencia en el output."
+            "15 años de price action institucional (Wyckoff, soportes/resistencias, "
+            "volume profile). Esperas el setup correcto antes de proponer. No operas "
+            "sin confluencia clara. Trabajas solo: no delegas ni preguntas a nadie."
         ),
         llm=get_crewai_llm(llm_settings.trader, llm_settings),
         tools=tools,
     )
 
 
-def build_risk_analyst(llm_settings: LLMSettings, tools: list | None = None) -> Agent:
+def build_risk_agent(
+    symbol: str, llm_settings: LLMSettings, tools: list | None = None
+) -> Agent:
+    """Risk aislado para un símbolo concreto. Instancia nueva por rama."""
     return _build_agent(
-        role="Analista de riesgo quant — EL ESCÉPTICO DEL EQUIPO",
+        role=f"Risk_{symbol}",
         goal=(
-            "Validar propuestas del trader. Tienes VETO sobre operaciones si el riesgo "
-            "es excesivo. Calcular R:R, peor escenario, max drawdown. "
-            "Si macro_risk=HIGH y evento cercano → VETO. "
-            "Si drawdown diario > MAX_DAILY_LOSS → VETO."
+            f"Validar la propuesta del Trader_{symbol}. Calcular R:R numérico y peor "
+            f"escenario. Emitir un risk_decision EXACTO de este conjunto: "
+            f"APPROVE_TRADE, APPROVE_NO_TRADE, MODIFY, NEED_DATA, VETO. "
+            f"Reglas: si el trader propone NO_OPERAR → APPROVE_NO_TRADE. "
+            f"Si faltan datos críticos → NEED_DATA. Si hay regla dura violada "
+            f"(macro_risk HIGH con evento cercano, drawdown diario excedido, "
+            f"R:R < mínimo) → VETO. Nunca uses 'APPROVE' a secas."
         ),
         backstory=(
-            "Vienes de un fondo donde sobreviviste drawdowns severos. "
-            "Tu mantra: '¿y si estoy equivocado?'. "
-            "Max drawdown, posición por vol, R:R mínimo, drawdown diario. "
-            "Sin 2+ confluence factors = veto. No te importa ser pesimista — "
-            "te importa evitar blowups."
+            "Vienes de un fondo donde sobreviviste drawdowns severos. Tu mantra: "
+            "'¿y si estoy equivocado?'. Prefieres perder una oportunidad antes que "
+            "un blowup. Eres terminal: no delegas ni preguntas a coworkers."
         ),
         llm=get_crewai_llm(llm_settings.risk_analyst, llm_settings),
         tools=tools,
     )
 
 
-def build_mtfa(llm_settings: LLMSettings, tools: list | None = None) -> Agent:
+def build_desk_manager(llm_settings: LLMSettings, tools: list | None = None) -> Agent:
+    """Manager final. allow_delegation=False — solo consolida, nunca delega."""
     return _build_agent(
-        role="Multi-Timeframe Analyst — confirmación de sesgo HTF",
+        role="Desk_Manager",
         goal=(
-            "Determinar el sesgo del activo en timeframes superiores (15min, 1h, 4h). "
-            "Si la dirección propuesta por el trader está CONTRA el sesgo HTF, "
-            "recomendar VETO o reducir confianza. Si está ALINEADA, confirmar."
+            "Consolidar los resultados YA EXISTENTES de cada rama (Trader + Risk por "
+            "símbolo) en una decisión final por símbolo. NO analizas mercados, NO "
+            "delegas, NO preguntas a nadie. Solo combinas lo que ya recibiste y "
+            "devuelves JSON estricto."
         ),
         backstory=(
-            "Trader con foco en análisis multi-timeframe. Wyckoff + Dow Theory. "
-            "Tu trabajo es evitar que el equipo opere en contra de la tendencia. "
-            "Si la dirección de la caja choca con el HTF, la probabilidad de éxito "
-            "cae drásticamente. Sé vocal: 'NO operen en contra del HTF'."
+            "Jefe de mesa con 15 años de experiencia. Tu palabra es final, pero te "
+            "basas únicamente en lo que el Trader y el Risk de cada símbolo ya "
+            "produjeron. Ante cualquier duda, NO_OPERAR."
         ),
-        llm=get_crewai_llm(llm_settings.mtfa, llm_settings),
+        llm=get_crewai_llm(llm_settings.decision_maker, llm_settings),
         tools=tools,
     )
 
 
 def build_position_manager(llm_settings: LLMSettings, tools: list | None = None) -> Agent:
+    """Gestor de trades abiertos (usado fuera del crew de análisis)."""
     return _build_agent(
-        role="Position Manager — gestor de trades abiertos",
+        role="Position_Manager",
         goal=(
-            "Gestionar trades abiertos: trailing stop, mover SL a breakeven "
-            "después de +1R, registrar eventos relevantes, sugerir cierres manuales "
-            "si un trade no progresa después de X horas."
+            "Gestionar trades abiertos: trailing stop, mover SL a breakeven tras "
+            "+1R, y registrar eventos relevantes. No delega."
         ),
         backstory=(
-            "Trader profesional que sabe que el 70% del profit viene del management, "
-            "no de la entrada. No dejas que un trade ganador se convierta en perdedor. "
-            "No dejas que un trade perdedor siga corriendo sin razón. "
-            "Trabajas con los datos de SQLite (source of truth) y los precios actuales "
-            "de Capital.com."
+            "El 70% del profit viene del management, no de la entrada. No dejas que "
+            "un trade ganador se vuelva perdedor ni que uno perdedor corra sin razón."
         ),
         llm=get_crewai_llm(llm_settings.position_manager, llm_settings),
         tools=tools,
     )
-
-
-def build_all_agents(
-    llm_settings: LLMSettings,
-    trader_tools: list | None = None,
-    risk_tools: list | None = None,
-    mtfa_tools: list | None = None,
-    pm_tools: list | None = None,
-    dm_tools: list | None = None,
-) -> dict[str, Agent]:
-    """Construye los 5 agentes. Cada uno puede tener tools propias."""
-    return {
-        "decision_maker": build_decision_maker(llm_settings, dm_tools),
-        "trader": build_trader(llm_settings, trader_tools),
-        "risk_analyst": build_risk_analyst(llm_settings, risk_tools),
-        "mtfa": build_mtfa(llm_settings, mtfa_tools),
-        "position_manager": build_position_manager(llm_settings, pm_tools),
-    }

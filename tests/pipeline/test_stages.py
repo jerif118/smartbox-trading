@@ -55,12 +55,22 @@ def test_ingest_input_validation() -> None:
     assert inp.timeframe == "MINUTE_5"
 
 
-def test_preprocess_output_validates_box() -> None:
-    """Box con amplitud > 1% debe rechazarse."""
-    from pydantic import ValidationError
-    from domain.errors import InvalidBoxError
+def test_preprocess_output_accepts_high_amplitude_for_skip_logic() -> None:
+    """Box con amplitud > 1% se calcula, pero no es tradeable."""
     bad_box = Box(high=102.0, low=100.0, amplitude_pct=2.0, n_candles=10)
-    with pytest.raises((ValidationError, InvalidBoxError)):
+    out = PreprocessOutput(
+        symbol="US500", box=bad_box, rsi_last=50, volume_profile=None, box_candles=[]
+    )
+    assert out.box is bad_box
+    assert not out.box.is_valid()
+
+
+def test_preprocess_output_rejects_malformed_box() -> None:
+    """El contrato sigue rechazando cajas sin niveles coherentes."""
+    from pydantic import ValidationError
+
+    bad_box = Box(high=99.0, low=100.0, amplitude_pct=-1.0, n_candles=10)
+    with pytest.raises(ValidationError):
         PreprocessOutput(
             symbol="US500", box=bad_box, rsi_last=50, volume_profile=None, box_candles=[]
         )

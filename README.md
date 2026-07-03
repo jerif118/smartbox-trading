@@ -266,6 +266,9 @@ Programa la tarea en **Programador de tareas** de Windows a las 7:50 AM.
 | `SIMPLE_REALITY` | `DEMO` | `DEMO` o `LIVE` |
 | `DB_PATH` | `./data/smartbox.db` | Path de la base de datos |
 | `STAGE_TIMEOUT_S` | `300` | Timeout (s) por stage de datos/broker |
+| `RUN_MODE` | `monitor` | `monitor` reintenta dentro de la ventana; `once` corre una sola vez |
+| `OPERATE_START`/`OPERATE_END` | `10:00`/`12:00` | Ventana local del mercado para esperar ruptura post-caja |
+| `MONITOR_INTERVAL_S` | `300` | Segundos entre corridas dentro de la ventana |
 | `ANALYZE_TIMEOUT_S` | `1800` | Timeout (s) del crew de agentes (stage 5) |
 
 ### Persistencia

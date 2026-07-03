@@ -53,7 +53,16 @@ class PreprocessOutput(BaseModel):
     @field_validator("box")
     @classmethod
     def validate_box(cls, v: Box) -> Box:
-        v.validate()  # regla #1
+        if v.high is None or v.low is None:
+            raise ValueError(f"Box sin niveles (high={v.high}, low={v.low})")
+        if v.high <= v.low:
+            raise ValueError(
+                f"Box inválida: high ({v.high}) <= low ({v.low})"
+            )
+        if v.amplitude_pct is None:
+            raise ValueError("Box sin amplitud calculada")
+        if v.n_candles <= 0:
+            raise ValueError(f"Box con {v.n_candles} velas")
         return v
 
 
@@ -116,6 +125,56 @@ class SymbolCrewData(BaseModel):
 class AnalyzeInput(BaseModel):
     symbols: list[SymbolCrewData] = Field(min_length=1)
     market: str = "S&P 500"
+
+
+# ── Outputs estructurados del crew (por símbolo) ──────────────────────
+ProposedDirection = Literal["LONG", "SHORT", "NO_OPERAR"]
+
+# Estados de riesgo explícitos. Se elimina "APPROVE" genérico/ambiguo.
+RiskDecision = Literal[
+    "APPROVE_TRADE",    # operar en la dirección propuesta
+    "APPROVE_NO_TRADE",  # aprobado NO operar (el trader propuso NO_OPERAR)
+    "MODIFY",           # operar pero con ajustes (niveles/tamaño)
+    "NEED_DATA",        # faltan datos críticos → NO_OPERAR
+    "VETO",             # regla dura violada → NO_OPERAR
+]
+
+
+class TraderAssessment(BaseModel):
+    """Salida estructurada del Trader de un símbolo. Conserva TODO el contexto."""
+
+    symbol: str
+    proposed_direction: ProposedDirection
+    confluence_score: int = Field(ge=0, le=100)
+    confidence: int = Field(default=0, ge=0, le=100)
+    rsi: float | None = None
+    vah: float | None = None
+    val: float | None = None
+    poc: float | None = None
+    breakout_state: str | None = None
+    macro_risk: str | None = None
+    mtf_alignment: str | None = None
+    reasons: list[str] = Field(default_factory=list)
+
+
+class RiskAssessment(BaseModel):
+    """Salida estructurada del Risk de un símbolo."""
+
+    symbol: str
+    risk_decision: RiskDecision
+    rr_ratio: float | None = None
+    reasons: list[str] = Field(default_factory=list)
+    # Niveles ajustados cuando risk_decision == MODIFY (opcional).
+    suggested_stop_loss: float | None = None
+    suggested_take_profit: float | None = None
+
+
+class SymbolResult(BaseModel):
+    """Resultado completo de una rama por símbolo: trader + risk."""
+
+    symbol: str
+    trader: TraderAssessment
+    risk: RiskAssessment
 
 
 class DecisionContract(BaseModel):

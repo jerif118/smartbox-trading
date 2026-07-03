@@ -54,7 +54,7 @@ def render() -> None:
             xaxis_title="",
             yaxis_title="USD",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     st.markdown("---")
 
@@ -68,7 +68,7 @@ def render() -> None:
             st.info("Sin posiciones abiertas")
         else:
             display = open_trades[["id", "symbol", "side", "volume", "entry_price", "stop_loss", "take_profit"]]
-            st.dataframe(display, use_container_width=True, hide_index=True)
+            st.dataframe(display, width="stretch", hide_index=True)
 
     with col_right:
         st.subheader("Últimos trades cerrados")
@@ -78,7 +78,7 @@ def render() -> None:
         else:
             closed_sorted = closed.sort_values("ts_open", ascending=False).head(10)
             display = closed_sorted[["id", "ts_open", "symbol", "side", "volume", "entry_price", "status", "pnl"]]
-            st.dataframe(display, use_container_width=True, hide_index=True)
+            st.dataframe(display, width="stretch", hide_index=True)
 
     st.markdown("---")
 
@@ -90,4 +90,4 @@ def render() -> None:
     else:
         display = runs_df[["id", "started_at", "finished_at", "status", "error"]].copy()
         display["id"] = display["id"].str[:8]
-        st.dataframe(display, use_container_width=True, hide_index=True)
+        st.dataframe(display, width="stretch", hide_index=True)

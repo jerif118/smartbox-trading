@@ -5,7 +5,9 @@
 #   docker compose logs -f           # ver logs
 #   docker compose down              # parar todo
 #
-# El bot corre como "one-shot" (termina tras cada corrida).
+# El bot respeta RUN_MODE en .env:
+#   RUN_MODE=monitor se mantiene vivo y reintenta durante la ventana operativa.
+#   RUN_MODE=once corre una sola vez y termina.
 # La UI queda corriendo para ver el dashboard en http://localhost:8501
 #   docker compose up -d ui          # solo el dashboard, sin disparar un run
 #
@@ -17,7 +19,13 @@
 # Para correr el bot periódicamente DENTRO de Docker, descomenta el servicio `scheduler`.
 
 services:
-  # ── Bot: corre el pipeline una vez y termina ────────────────────────────
+  # ── Bot: modo según RUN_MODE en .env ────────────────────────────────────
+  #   RUN_MODE=once    → corre el pipeline una vez y termina (cron externo).
+  #   RUN_MODE=monitor → se mantiene vivo y monitorea dentro de la ventana
+  #                      operativa (OPERATE_START..OPERATE_END). NO termina con
+  #                      "exited code 0" tras una sola corrida.
+  # `run` respeta RUN_MODE. `restart: unless-stopped` re-levanta el monitor si
+  # se cae. En modo once, cámbialo a "no" o usa `docker compose run --rm bot`.
   bot:
     build:
       context: .
@@ -37,7 +45,7 @@ services:
       - bot_data:/app/data
       - bot_logs:/app/logs
     command: ["python", "-m", "interfaces.cli.main", "run"]
-    restart: "no"
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "from interfaces.cli.main import main; main(['doctor'])"]
       interval: 5m

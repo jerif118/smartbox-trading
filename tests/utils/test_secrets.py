@@ -69,6 +69,13 @@ def test_validate_credentials_dry_run_ok(monkeypatch):
     assert s.validate_credentials() == []
 
 
+def test_min_rr_default_matches_box_template(monkeypatch):
+    monkeypatch.delenv("MIN_RR_RATIO", raising=False)
+    reset_settings_cache()
+    s = Settings(_env_file=None)
+    assert s.min_rr_ratio == 1.0
+
+
 def test_validate_credentials_openai_compatible_needs_url_and_key(monkeypatch):
     monkeypatch.setenv("AGENT_MTFA_MODEL", "openai_compatible/mi-modelo")
     monkeypatch.delenv("OPENAI_COMPATIBLE_BASE_URL", raising=False)

@@ -27,8 +27,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from typing import Any
 
-from application.agents.agents import build_all_agents
 from domain.market_time import box_window_unix
+from domain.strategy.box import MAX_AMPLITUDE_PCT
 from domain.strategy.budget import DailyOrderBudget
 from infrastructure.broker.capital.adapter import CapitalAdapter
 from infrastructure.broker.simplefx.adapter import SimpleFXAdapter
@@ -95,7 +95,7 @@ def run_pipeline() -> RunResult:
     # ── Config snapshot ────────────────────────────────────────────────
     config_snap = {
         "symbols": settings.symbol_list,
-        "primary_symbol": settings.primary_symbol,
+        "primary_symbol": settings.primary_symbol_resolved,
         "volume": settings.volume,
         "max_orders_per_day": settings.max_orders_per_day,
         "min_rr_ratio": settings.min_rr_ratio,
@@ -130,10 +130,11 @@ def run_pipeline() -> RunResult:
         pending_warnings = reconcile_pending_trades(run_id)
         errors.extend(pending_warnings)
 
-        # ── Init adapters y agentes ────────────────────────────────────
+        # ── Init adapters ──────────────────────────────────────────────
+        # Los agentes del crew se construyen por símbolo DENTRO de stage_analyze
+        # (instancias aisladas por rama, nunca compartidas).
         broker = SimpleFXAdapter(settings)
         market_data = CapitalAdapter(settings)
-        agents = build_all_agents(settings.llm)
 
         # ── STAGE 7: Manage open positions (siempre primero) ───────────
         log.info("STAGE 7 · Position Manager (open trades)")
@@ -215,6 +216,12 @@ def run_pipeline() -> RunResult:
                     "[preprocess] %s: box=%.2f-%.2f amp=%.2f%% RSI=%s",
                     sym, pp_out.box.low, pp_out.box.high, pp_out.box.amplitude_pct, pp_out.rsi_last,
                 )
+                if not pp_out.box.is_valid():
+                    log.info(
+                        "[preprocess] %s: amplitud %.2f%% > %.2f%% -> NO_OPERAR",
+                        sym, pp_out.box.amplitude_pct, MAX_AMPLITUDE_PCT,
+                    )
+                    return None
 
                 # Stage 4 — regla #6: solo velas de las 2h posteriores a la caja
                 _, box_to = box_window_unix(
@@ -233,7 +240,7 @@ def run_pipeline() -> RunResult:
                     symbol=sym,
                     df_candles=post_box,
                     box=pp_out.box,
-                    primary=(sym == settings.primary_symbol),
+                    primary=(sym == settings.primary_symbol_resolved),
                 )
                 sig_out = run_stage(
                     f"s4_signal:{sym}", run_id, stage_signal, sig_in,
@@ -358,7 +365,7 @@ def run_pipeline() -> RunResult:
 
         analyze_in = AnalyzeInput(symbols=crew_symbols_data, market=settings.market)
         analyze_out = run_stage(
-            "s5_analyze", run_id, stage_analyze, analyze_in, run_id, agents,
+            "s5_analyze", run_id, stage_analyze, analyze_in, run_id,
             timeout_s=settings.analyze_timeout_s,
         )
         decisions_count = len(analyze_out.decisions)
@@ -393,6 +400,7 @@ def run_pipeline() -> RunResult:
                 continue
             orders_sent += len(exec_out.orders)
             if exec_out.errors:
+                log.warning("[execute] %s: %s", decision.symbol, "; ".join(exec_out.errors))
                 errors.extend(exec_out.errors)
             if exec_out.skipped:
                 log.info("[execute] %s: %d orden(es) saltadas por idempotencia",
