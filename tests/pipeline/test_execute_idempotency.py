@@ -167,3 +167,31 @@ def test_reconcile_expires_old_pending_and_warns_today():
     assert trade_repo.get_trade(today_id).status == "PENDING"
     assert len(warnings) == 1
     assert "no se reenviará" in warnings[0]
+
+
+def test_reconcile_expires_old_dry_open_trades():
+    """OPEN simulados (DRY-*) de días previos → EXPIRED; los reales y los de
+    hoy no se tocan."""
+    dry_old = trade_repo.insert_trade(
+        RUN_ID, "US500", "BUY", 0.5, 5000.0, None, None, is_runner=False,
+        status="OPEN", broker_order_id="DRY-1", client_order_id="2026-06-11:US500:BUY:P",
+    )
+    real_old = trade_repo.insert_trade(
+        RUN_ID, "US500", "BUY", 0.5, 5000.0, None, None, is_runner=True,
+        status="OPEN", broker_order_id="123456", client_order_id="2026-06-11:US500:BUY:R",
+    )
+    dry_today = trade_repo.insert_trade(
+        RUN_ID, "US100", "SELL", 0.5, 20000.0, None, None, is_runner=False,
+        status="OPEN", broker_order_id="DRY-2", client_order_id="hoy:US100:SELL:P",
+    )
+    with db.get_db() as conn:
+        conn.execute(
+            "UPDATE trades SET ts_open = '2026-06-11T12:00:00+00:00' WHERE id IN (?, ?)",
+            (dry_old, real_old),
+        )
+
+    reconcile_pending_trades(RUN_ID)
+
+    assert trade_repo.get_trade(dry_old).status == "EXPIRED"
+    assert trade_repo.get_trade(real_old).status == "OPEN"
+    assert trade_repo.get_trade(dry_today).status == "OPEN"

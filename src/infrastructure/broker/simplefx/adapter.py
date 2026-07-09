@@ -1,11 +1,11 @@
 """
 Adaptador SimpleFX: implementa `BrokerGateway`.
 
-Solo usa endpoints que YA EXISTEN en el código actual (api_requests.py, make_order.py):
-- POST /api/v3/auth/key          (login)
+Endpoints usados (verificados contra el swagger oficial, oas3-3.1.json):
+- POST /api/v3/auth/key                (login)
 - POST /api/v3/trading/orders/pending  (place_order)
-- PUT  /api/v3/trading/orders/market   (modify_order)
-- GET  /api/v3/candles                 (precio)
+- PUT  /api/v3/trading/orders/pending  (modify de orden aún no activada)
+- PUT  /api/v3/trading/orders/market   (modify de posición ya activada)
 
 NO añade endpoints nuevos (list_positions, get_account, etc.) — la fuente de
 verdad para el Position Manager es SQLite, no el broker.
@@ -74,7 +74,35 @@ def _place_order(
     return resp.json()
 
 
-@retry(max_retries=2, backoff=2.0, exceptions=(requests.RequestException,))
+def _modify_at(
+    endpoint: str,
+    token: str,
+    account: str,
+    reality: str,
+    id_trade: int,
+    stop_loss: float | None = None,
+    take_profit: float | None = None,
+) -> dict[str, Any]:
+    url = f"{SIMPLE_BASE}/api/v3/trading/orders/{endpoint}"
+    headers = {"Authorization": f"Bearer {token}"}
+    body: dict[str, Any] = {
+        "Login": int(account),
+        "Reality": reality.upper(),
+        "Id": id_trade,
+    }
+    if take_profit is not None:
+        body["TakeProfit"] = take_profit
+    if stop_loss is not None:
+        body["StopLoss"] = stop_loss
+    log.info("Modify %s %d: SL=%s TP=%s", endpoint, id_trade, stop_loss, take_profit)
+    resp = requests.put(url, headers=headers, json=body, timeout=20)
+    if resp.status_code >= 400:
+        log.warning("SimpleFX modify %s %d: %s", endpoint, resp.status_code, resp.text[:300])
+    resp.raise_for_status()
+    return resp.json()
+
+
+@retry(max_retries=2, backoff=2.0, exceptions=(requests.ConnectionError, requests.Timeout))
 def _modify_order(
     token: str,
     account: str,
@@ -83,21 +111,41 @@ def _modify_order(
     stop_loss: float | None = None,
     take_profit: float | None = None,
 ) -> dict[str, Any]:
-    url = f"{SIMPLE_BASE}/api/v3/trading/orders/market"
-    headers = {"Authorization": f"Bearer {token}"}
-    body: dict[str, Any] = {
-        "Login": account,
-        "Reality": reality,
-        "Id": id_trade,
-    }
-    if take_profit is not None:
-        body["TakeProfit"] = take_profit
-    if stop_loss is not None:
-        body["StopLoss"] = stop_loss
-    log.info("Modify %d: SL=%s TP=%s", id_trade, stop_loss, take_profit)
-    resp = requests.put(url, headers=headers, json=body, timeout=20)
-    resp.raise_for_status()
-    return resp.json()
+    """Modifica SL/TP. El bot coloca órdenes PENDING; mientras no se activan
+    el id pertenece a una pending order (PUT /orders/pending). Si la orden ya
+    se activó, ese PUT falla y se reintenta contra la posición de mercado
+    (PUT /orders/market)."""
+    try:
+        return _modify_at(
+            "pending", token, account, reality, id_trade,
+            stop_loss=stop_loss, take_profit=take_profit,
+        )
+    except requests.HTTPError:
+        return _modify_at(
+            "market", token, account, reality, id_trade,
+            stop_loss=stop_loss, take_profit=take_profit,
+        )
+
+
+def _extract_order_id(result: dict[str, Any]) -> str | None:
+    """Extrae el id de la orden de la respuesta real de SimpleFX.
+
+    Forma oficial (swagger): {"data": {"pendingOrders": [{"action": ..,
+    "order": {"id": ..}}], "marketOrders": [...]}, "code": .., ...}
+    """
+    data = result.get("data") or {}
+    for key in ("pendingOrders", "marketOrders"):
+        entries = data.get(key) or []
+        for entry in entries:
+            order = (entry or {}).get("order") or {}
+            if order.get("id") is not None:
+                return str(order["id"])
+    # Fallbacks defensivos por si el formato cambia
+    for container in (data, result):
+        for key in ("id", "orderId"):
+            if container.get(key) is not None:
+                return str(container[key])
+    return None
 
 
 class SimpleFXAdapter:
@@ -147,13 +195,17 @@ class SimpleFXAdapter:
             take_profit=take_profit,
             reality=self._settings.simple_reality,
         )
-        # Estructura típica: {"data": {"id": 12345, ...}}
-        order_id = (
-            result.get("data", {}).get("id")
-            or result.get("id")
-            or str(result.get("orderId", "unknown"))
-        )
-        return str(order_id)
+        order_id = _extract_order_id(result)
+        if order_id is None:
+            # La orden YA fue aceptada por el broker: no lanzar (un raise haría
+            # que s6 la marque REJECTED y libere el coid → orden duplicada).
+            # Se conserva el trade con id "unknown" y se pide reconciliación.
+            log.critical(
+                "SimpleFX aceptó la orden pero la respuesta no trae id "
+                "(reconciliar manualmente): %s", str(result)[:300],
+            )
+            return "unknown"
+        return order_id
 
     def modify_order(
         self,
@@ -164,6 +216,11 @@ class SimpleFXAdapter:
         if self._settings.dry_run:
             log.info("DRY_RUN: simulación modify %s SL=%s TP=%s", broker_order_id, stop_loss, take_profit)
             return
+        if not str(broker_order_id).isdigit():
+            raise ValueError(
+                f"broker_order_id no numérico ({broker_order_id!r}): "
+                "orden sin id real, reconciliar manualmente contra el broker"
+            )
         token = self._get_token()
         _modify_order(
             token=token,

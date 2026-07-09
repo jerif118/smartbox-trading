@@ -64,7 +64,9 @@ def get_trades_df(
     trades = trade_repo.list_trades(symbol=symbol, status=status, limit=limit)
     if not trades:
         return pd.DataFrame()
-    return pd.DataFrame([t.to_dict() for t in trades])
+    # __dict__ (no to_dict): to_dict omite campos None y la UI selecciona
+    # columnas fijas (p.ej. "pnl") → KeyError si todos los trades lo tienen None
+    return pd.DataFrame([t.__dict__ for t in trades])
 
 
 def get_recent_runs(limit: int = 20) -> pd.DataFrame:

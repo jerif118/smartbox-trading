@@ -57,18 +57,45 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"Símbolos activos (filtrados): {settings.symbol_list}")
 
     if mode == "monitor":
+        import threading
+
         from pipeline.monitor import WindowConfig, run_monitor
 
         window = WindowConfig.from_settings(settings)
         print(
             f"RUN_MODE=monitor | ventana {settings.operate_start}-{settings.operate_end} "
-            f"({settings.market_tz}) cada {settings.monitor_interval_s}s. Ctrl+C para salir."
+            f"({settings.market_tz}) alineado a velas de {settings.monitor_interval_s}s. "
+            "Ctrl+C para salir."
         )
+
+        wake_event: threading.Event | None = None
+        stream = None
+        if settings.stream_enabled:
+            from infrastructure.broker.capital.stream import CapitalOHLCStream
+
+            event = threading.Event()
+            stream = CapitalOHLCStream(
+                epics=settings.symbol_list,
+                resolution=settings.timeframe,
+                on_bar_close=lambda bar: event.set(),
+                settings=settings,
+            )
+            try:
+                stream.start()
+                wake_event = event
+                print("Stream de Capital.com activo (gatillo por cierre de vela).")
+            except Exception as e:  # sin socket se sigue por reloj
+                log.warning("No se pudo iniciar el stream (%s) — monitor por reloj", e)
+                stream = None
+
         try:
-            n = run_monitor(run_pipeline, window)
+            n = run_monitor(run_pipeline, window, wake_event=wake_event)
         except KeyboardInterrupt:
             print("\nMonitor detenido por el usuario.")
             return 0
+        finally:
+            if stream is not None:
+                stream.stop()
         print(f"Monitor finalizado tras {n} corrida(s).")
         return 0
 

@@ -63,12 +63,32 @@ def reconcile_pending_trades(run_id: str) -> list[str]:
       al broker sin confirmación. Su client_order_id sigue bloqueando
       reenvíos; la reconciliación contra el broker es manual (SimpleFX no
       expone listado de órdenes).
+    - OPEN simulados (broker_order_id DRY-*) de días previos → EXPIRED:
+      nunca tuvieron orden real que cerrar y el Position Manager los
+      gestionaría para siempre.
     Retorna mensajes de advertencia.
     """
     from datetime import UTC, datetime
 
     today = datetime.now(UTC).date().isoformat()
     warnings: list[str] = []
+
+    for trade in trade_repo.list_open_trades():
+        trade_day = (trade.ts_open or "")[:10]
+        is_dry = str(trade.broker_order_id or "").startswith("DRY-")
+        if is_dry and trade_day < today:
+            trade_repo.update_status(trade.id, "EXPIRED")
+            log.info(
+                "Trade OPEN simulado %s (%s) del %s → EXPIRED",
+                trade.id, trade.broker_order_id, trade_day,
+            )
+            event_repo.log_event(
+                run_id=run_id,
+                agent="decision_maker",
+                event_type="SYSTEM",
+                payload={"reconcile": "dry_open_expired", "trade_id": trade.id},
+            )
+
     for trade in trade_repo.list_pending_trades():
         trade_day = (trade.ts_open or "")[:10]
         if trade_day < today:

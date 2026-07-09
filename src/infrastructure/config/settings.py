@@ -182,7 +182,14 @@ class Settings(BaseSettings):
     operate_start: str = Field(default="10:00", alias="OPERATE_START")
     operate_end: str = Field(default="12:00", alias="OPERATE_END")
     # Cada cuánto vuelve a correr el pipeline dentro de la ventana (segundos).
+    # El monitor se alinea al cierre de vela: corre en el próximo múltiplo de
+    # este intervalo + monitor_grace_s (no cada N segundos desde el arranque).
     monitor_interval_s: int = Field(default=300, alias="MONITOR_INTERVAL_S", ge=10)
+    # Margen tras el cierre de vela antes de correr (deja llegar la vela al REST).
+    monitor_grace_s: float = Field(default=5.0, alias="MONITOR_GRACE_S", ge=0)
+    # WebSocket de Capital.com como gatillo del monitor: corre el pipeline en
+    # cuanto cierra una vela. Si el socket cae, el monitor sigue por reloj.
+    stream_enabled: bool = Field(default=True, alias="STREAM_ENABLED")
 
     # ── Persistencia ──────────────────────────────────────────────────────
     db_path: str = Field(default="./data/smartbox.db", alias="DB_PATH")

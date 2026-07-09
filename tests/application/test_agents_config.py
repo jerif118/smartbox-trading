@@ -209,6 +209,30 @@ def test_drawdown_guard_veto() -> None:
     assert result["exceeded"] is True
 
 
+def test_drawdown_guard_lee_db_de_settings(tmp_path, monkeypatch) -> None:
+    """La tool usa settings.db_path (no una ruta relativa hardcodeada):
+    el PnL realizado hoy en esa DB cuenta para el drawdown."""
+    import json
+    import sqlite3
+    from datetime import UTC, datetime
+
+    db_file = tmp_path / "guard.db"
+    monkeypatch.setenv("DB_PATH", str(db_file))
+    reset_settings_cache()
+
+    with sqlite3.connect(db_file) as conn:
+        conn.execute("CREATE TABLE trades (id INTEGER PRIMARY KEY, ts_close TEXT, pnl REAL)")
+        conn.execute(
+            "INSERT INTO trades (ts_close, pnl) VALUES (?, ?)",
+            (datetime.now(UTC).isoformat(), -600.0),
+        )
+
+    tool = DrawdownGuardTool()
+    result = json.loads(tool._run(max_daily_loss=500, current_daily_pnl=0.0))
+    assert result["daily_pnl"] == -600.0
+    assert result["recommendation"] == "VETO"
+
+
 def test_scrape_macro_tool_with_mock() -> None:
     with patch(
         "infrastructure.data_sources.scrapers.InvestingMacroCalendarAdapter.get_high_impact_events"

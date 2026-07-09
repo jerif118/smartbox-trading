@@ -5,8 +5,9 @@ y autenticación para descargar velas. NO ejecuta órdenes.
 
 from __future__ import annotations
 
+import threading
 import time
-from typing import Any
+from typing import Any, ClassVar
 
 import pandas as pd
 import requests
@@ -99,23 +100,40 @@ def _standardize(prices: list[dict]) -> pd.DataFrame:
 
 
 class CapitalAdapter:
-    """Proveedor de datos OHLCV de Capital.com."""
+    """Proveedor de datos OHLCV de Capital.com.
+
+    El caché de tokens es de CLASE (compartido entre instancias, con lock):
+    el pipeline y las tools de los agentes crean adapters nuevos por llamada
+    y Capital.com limita la creación de sesiones (~1/s) — sin caché compartido
+    cada corrida dispara varios logins concurrentes → error.too-many.requests.
+    """
+
+    _shared_tokens: ClassVar[dict[str, str]] = {}
+    _shared_tokens_ts: ClassVar[float] = 0.0
+    _tokens_lock: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(self, settings=None):
         self._settings = settings or get_settings()
-        self._tokens: dict[str, str] = {}
-        self._tokens_ts: float = 0.0
+
+    @classmethod
+    def reset_token_cache(cls) -> None:
+        """Invalida el caché compartido (tests / re-login forzado)."""
+        with cls._tokens_lock:
+            cls._shared_tokens = {}
+            cls._shared_tokens_ts = 0.0
 
     def _get_tokens(self) -> dict[str, str]:
-        if self._tokens and (time.time() - self._tokens_ts) < 1500:
-            return self._tokens
-        if not self._settings.email or not self._settings.password or not self._settings.api_key:
-            raise RuntimeError("Capital.com credentials no configuradas")
-        self._tokens = _login(
-            self._settings.email, self._settings.password, self._settings.api_key
-        )
-        self._tokens_ts = time.time()
-        return self._tokens
+        cls = CapitalAdapter
+        with cls._tokens_lock:
+            if cls._shared_tokens and (time.time() - cls._shared_tokens_ts) < 1500:
+                return cls._shared_tokens
+            if not self._settings.email or not self._settings.password or not self._settings.api_key:
+                raise RuntimeError("Capital.com credentials no configuradas")
+            cls._shared_tokens = _login(
+                self._settings.email, self._settings.password, self._settings.api_key
+            )
+            cls._shared_tokens_ts = time.time()
+            return cls._shared_tokens
 
     def get_candles(
         self,

@@ -20,6 +20,7 @@ dependencies = [
     "beautifulsoup4>=4.12",
     "lxml>=5.0",
     "colorlog>=6.7",
+    "websocket-client>=1.7",
 ]
 
 [project.optional-dependencies]

@@ -211,8 +211,10 @@ class DrawdownGuardTool(BaseTool):
     def _run(self, max_daily_loss: float, current_daily_pnl: float = 0.0) -> str:
         import sqlite3
 
+        from infrastructure.config.settings import get_settings
+
         try:
-            with sqlite3.connect("./data/smartbox.db") as conn:
+            with sqlite3.connect(get_settings().db_path) as conn:
                 today = datetime.now(UTC).date().isoformat()
                 row = conn.execute(
                     "SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE DATE(ts_close) = ? AND pnl IS NOT NULL",
