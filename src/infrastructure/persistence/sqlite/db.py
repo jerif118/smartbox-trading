@@ -25,7 +25,7 @@ _INITIALIZED: set[str] = set()  # paths ya inicializados
 
 # Versión actual del schema. schema.sql refleja SIEMPRE el estado final;
 # las DBs existentes se llevan a ese estado aplicando _MIGRATIONS en orden.
-LATEST_SCHEMA_VERSION = 1
+LATEST_SCHEMA_VERSION = 3
 
 _MIGRATIONS: dict[int, str] = {
     1: """
@@ -50,6 +50,13 @@ _MIGRATIONS: dict[int, str] = {
 
     CREATE INDEX IF NOT EXISTS idx_stage_metrics_run_id ON stage_metrics(run_id);
     CREATE INDEX IF NOT EXISTS idx_stage_metrics_stage ON stage_metrics(stage);
+    """,
+    2: """
+    ALTER TABLE trades ADD COLUMN initial_stop_loss REAL;
+    UPDATE trades SET initial_stop_loss = stop_loss WHERE initial_stop_loss IS NULL;
+    """,
+    3: """
+    ALTER TABLE trades ADD COLUMN max_favorable_price REAL;
     """,
 }
 

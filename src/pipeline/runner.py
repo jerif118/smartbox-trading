@@ -33,7 +33,7 @@ from pipeline.errors import (
     StageNetworkError,
     StageTimeoutError,
 )
-from utils.logger import get_logger
+from utils.logger import get_logger, log_context
 
 log = get_logger(__name__)
 
@@ -63,8 +63,13 @@ def _persist_metric(
     # La métrica nunca debe tumbar el stage que la genera.
     try:
         stage_metrics_repo.insert_stage_metric(
-            run_id, stage, status, started_at, duration_ms,
-            error_type=error_type, error_msg=error_msg[:500] if error_msg else None,
+            run_id,
+            stage,
+            status,
+            started_at,
+            duration_ms,
+            error_type=error_type,
+            error_msg=error_msg[:500] if error_msg else None,
         )
     except Exception as e:  # noqa: BLE001 — best-effort por diseño
         log.warning("No se pudo persistir métrica de %s: %s", stage, e)
@@ -76,43 +81,61 @@ def run_stage(
     fn: Callable[..., T],
     *args: Any,
     timeout_s: float | None = None,
+    side_effecting: bool = False,
     **kwargs: Any,
 ) -> T:
-    """Ejecuta un stage con timeout y métricas. Lanza StageError tipado al fallar."""
+    """Ejecuta un stage con métricas y timeout cuando es cancelable.
+
+    Los stages con efectos externos se ejecutan inline: Python no puede matar
+    un thread de forma segura y no queremos que una orden siga corriendo luego
+    de que el orquestador haya declarado timeout.
+    """
     started_at = datetime.now(UTC).isoformat()
     t0 = time.monotonic()
     outcome: dict[str, Any] = {}
 
-    def _target() -> None:
-        try:
-            outcome["value"] = fn(*args, **kwargs)
-        except BaseException as e:  # noqa: BLE001 — se traduce y re-lanza en el caller
-            outcome["error"] = e
+    # El símbolo va en el nombre del stage tras ":" (ej. "s1_ingest:US500").
+    stage_symbol = name.split(":", 1)[1] if ":" in name else None
 
-    worker = threading.Thread(target=_target, name=f"stage-{name}", daemon=True)
-    worker.start()
-    worker.join(timeout_s)
+    def _target() -> None:
+        # Correlación en logs; log_context resetea al salir (importa cuando el
+        # stage side_effecting corre inline en el hilo principal).
+        with log_context(run_id=run_id, symbol=stage_symbol):
+            try:
+                outcome["value"] = fn(*args, **kwargs)
+            except BaseException as e:  # noqa: BLE001 — se traduce y re-lanza en el caller
+                outcome["error"] = e
+
+    worker: threading.Thread | None = None
+    if side_effecting:
+        _target()
+    else:
+        worker = threading.Thread(target=_target, name=f"stage-{name}", daemon=True)
+        worker.start()
+        worker.join(timeout_s)
     duration_ms = int((time.monotonic() - t0) * 1000)
 
-    if worker.is_alive():
+    if worker is not None and worker.is_alive():
         msg = f"timeout tras {timeout_s:.0f}s"
         log.error("Stage %s: %s", name, msg)
-        _persist_metric(run_id, name, "timeout", started_at, duration_ms,
-                        "StageTimeoutError", msg)
+        _persist_metric(run_id, name, "timeout", started_at, duration_ms, "StageTimeoutError", msg)
         raise StageTimeoutError(name, msg)
 
     if "error" in outcome:
         raw_err = outcome["error"]
         if not isinstance(raw_err, Exception):
             # SystemExit/KeyboardInterrupt: registrar y propagar sin traducir
-            _persist_metric(run_id, name, "error", started_at, duration_ms,
-                            type(raw_err).__name__, str(raw_err))
+            _persist_metric(
+                run_id, name, "error", started_at, duration_ms, type(raw_err).__name__, str(raw_err)
+            )
             raise raw_err
         err = translate_exception(name, outcome["error"])
-        log.error("Stage %s falló (%s): %s", name, type(err).__name__, err,
-                  exc_info=outcome["error"])
-        _persist_metric(run_id, name, "error", started_at, duration_ms,
-                        type(err).__name__, str(err))
+        log.error(
+            "Stage %s falló (%s): %s", name, type(err).__name__, err, exc_info=outcome["error"]
+        )
+        _persist_metric(
+            run_id, name, "error", started_at, duration_ms, type(err).__name__, str(err)
+        )
         raise err
 
     _persist_metric(run_id, name, "ok", started_at, duration_ms)

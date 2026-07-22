@@ -38,14 +38,25 @@ def insert_trade(
             """
             INSERT INTO trades (
                 run_id, decision_id, ts_open, symbol, side, volume,
-                entry_price, stop_loss, take_profit, is_runner,
+                entry_price, stop_loss, initial_stop_loss, take_profit, is_runner,
                 broker_order_id, status, client_order_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                run_id, decision_id, ts, symbol, side, volume,
-                entry_price, stop_loss, take_profit, 1 if is_runner else 0,
-                broker_order_id, status, client_order_id,
+                run_id,
+                decision_id,
+                ts,
+                symbol,
+                side,
+                volume,
+                entry_price,
+                stop_loss,
+                stop_loss,
+                take_profit,
+                1 if is_runner else 0,
+                broker_order_id,
+                status,
+                client_order_id,
             ),
         )
     return int(cur.lastrowid)
@@ -109,6 +120,19 @@ def modify_sl_tp(
         conn.execute(
             f"UPDATE trades SET {', '.join(fields)} WHERE id = ?",
             values,
+        )
+
+
+def update_max_favorable(trade_id: int, price: float) -> None:
+    """Actualiza la máxima excursión favorable (high-water) del trade.
+
+    Base para el trailing stop: el SL se arrastra respecto al mejor precio
+    alcanzado, no respecto al precio del momento (que puede haber retrocedido).
+    """
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE trades SET max_favorable_price = ?, updated_at = ? WHERE id = ?",
+            (price, _now(), trade_id),
         )
 
 
@@ -177,8 +201,19 @@ def count_orders_today() -> int:
     today = datetime.now(UTC).date().isoformat()
     with get_db() as conn:
         row = conn.execute(
-            "SELECT COUNT(*) FROM trades "
-            "WHERE DATE(ts_open) = ? AND status != 'REJECTED'",
+            "SELECT COUNT(*) FROM trades WHERE DATE(ts_open) = ? AND status != 'REJECTED'",
+            (today,),
+        ).fetchone()
+    return int(row[0])
+
+
+def count_setups_today() -> int:
+    """Símbolos distintos operados hoy, excluyendo intentos fallidos/expirados."""
+    today = datetime.now(UTC).date().isoformat()
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT COUNT(DISTINCT symbol) FROM trades "
+            "WHERE DATE(ts_open) = ? AND status NOT IN ('REJECTED', 'EXPIRED')",
             (today,),
         ).fetchone()
     return int(row[0])
@@ -189,8 +224,7 @@ def realized_pnl_today() -> float:
     today = datetime.now(UTC).date().isoformat()
     with get_db() as conn:
         row = conn.execute(
-            "SELECT COALESCE(SUM(pnl), 0) FROM trades "
-            "WHERE pnl IS NOT NULL AND DATE(ts_close) = ?",
+            "SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE pnl IS NOT NULL AND DATE(ts_close) = ?",
             (today,),
         ).fetchone()
     return float(row[0] or 0.0)
@@ -201,14 +235,13 @@ def compute_stats() -> dict[str, Any]:
     with get_db() as conn:
         total = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
         closed = conn.execute(
-            "SELECT COUNT(*) FROM trades WHERE status IN ('CLOSED_TP', 'CLOSED_SL', 'CLOSED_MANUAL')"
+            "SELECT COUNT(*) FROM trades "
+            "WHERE status IN ('CLOSED_TP', 'CLOSED_SL', 'CLOSED_MANUAL')"
         ).fetchone()[0]
-        wins = conn.execute(
-            "SELECT COUNT(*) FROM trades WHERE status = 'CLOSED_TP'"
-        ).fetchone()[0]
-        losses = conn.execute(
-            "SELECT COUNT(*) FROM trades WHERE status = 'CLOSED_SL'"
-        ).fetchone()[0]
+        wins = conn.execute("SELECT COUNT(*) FROM trades WHERE status = 'CLOSED_TP'").fetchone()[0]
+        losses = conn.execute("SELECT COUNT(*) FROM trades WHERE status = 'CLOSED_SL'").fetchone()[
+            0
+        ]
         total_pnl = conn.execute(
             "SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE pnl IS NOT NULL"
         ).fetchone()[0]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 
 import pytest
@@ -55,6 +56,18 @@ def test_run_stage_timeout(temp_db):
     assert metrics[0]["error_type"] == "StageTimeoutError"
 
 
+def test_side_effecting_stage_runs_inline(temp_db):
+    caller_thread = threading.get_ident()
+    executed_thread = run_stage(
+        "s_order",
+        RUN_ID,
+        threading.get_ident,
+        timeout_s=0.01,
+        side_effecting=True,
+    )
+    assert executed_thread == caller_thread
+
+
 def test_run_stage_translates_network_error(temp_db):
     def boom():
         raise requests.ConnectionError("broker caído")
@@ -99,9 +112,7 @@ def test_run_stage_unknown_error_becomes_stage_error(temp_db):
 
 
 def test_translate_exception_mapping():
-    assert isinstance(
-        translate_exception("s", requests.Timeout("t")), StageNetworkError
-    )
+    assert isinstance(translate_exception("s", requests.Timeout("t")), StageNetworkError)
     assert isinstance(translate_exception("s", ValueError("v")), StageDataError)
     assert isinstance(translate_exception("s", KeyError("k")), StageDataError)
     generic = translate_exception("s", RuntimeError("r"))
@@ -112,7 +123,5 @@ def test_metric_failure_does_not_break_stage(temp_db, monkeypatch):
     def broken_metric(*args, **kwargs):
         raise RuntimeError("DB de métricas rota")
 
-    monkeypatch.setattr(
-        "pipeline.runner.stage_metrics_repo.insert_stage_metric", broken_metric
-    )
+    monkeypatch.setattr("pipeline.runner.stage_metrics_repo.insert_stage_metric", broken_metric)
     assert run_stage("s_ok", RUN_ID, lambda: "fine") == "fine"

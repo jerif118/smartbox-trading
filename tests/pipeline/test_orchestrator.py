@@ -58,8 +58,10 @@ def _mock_stages(monkeypatch, analyze_side_effect=None):
     df = pd.DataFrame(
         {
             "time": [1500, 1800, 2100],
-            "open": [100.0] * 3, "high": [101.0] * 3,
-            "low": [99.5] * 3, "close": [100.8] * 3,
+            "open": [100.0] * 3,
+            "high": [101.0] * 3,
+            "low": [99.5] * 3,
+            "close": [100.8] * 3,
             "volume": [100] * 3,
         }
     )
@@ -69,31 +71,47 @@ def _mock_stages(monkeypatch, analyze_side_effect=None):
     monkeypatch.setattr(orchestrator, "SimpleFXAdapter", MagicMock())
     monkeypatch.setattr(orchestrator, "CapitalAdapter", MagicMock())
     monkeypatch.setattr(
-        orchestrator, "stage_ingest",
+        orchestrator,
+        "stage_ingest",
         lambda inp: IngestOutput(symbol=inp.symbol, df_candles=df, n_candles=len(df)),
     )
     monkeypatch.setattr(
-        orchestrator, "stage_preprocess",
+        orchestrator,
+        "stage_preprocess",
         lambda inp, df_c: PreprocessOutput(
-            symbol=inp.symbol, box=box, rsi_last=55.0, volume_profile=None, box_candles=[],
+            symbol=inp.symbol,
+            box=box,
+            rsi_last=55.0,
+            volume_profile=None,
+            box_candles=[],
         ),
     )
     monkeypatch.setattr(
-        orchestrator, "stage_signal",
+        orchestrator,
+        "stage_signal",
         lambda inp: SignalOutput(
-            symbol=inp.symbol, has_breakout=True, breakout_state="ABOVE",
-            candle_close=100.8, signal_time="2026-06-11T15:00:00",
+            symbol=inp.symbol,
+            has_breakout=True,
+            breakout_state="ABOVE",
+            candle_close=100.8,
+            signal_time="2026-06-11T15:00:00",
         ),
     )
     monkeypatch.setattr(
-        orchestrator, "stage_context",
+        orchestrator,
+        "stage_context",
         lambda inp: ContextOutput(macro_risk="LOW", high_impact_events=[]),
     )
 
     decision = DecisionContract(
-        symbol="US500", action=Action.LONG, risk=RiskMode.COMPLETO,
-        confidence=80, reasons=["test"], key_levels={"high": 100.5, "low": 100.0},
-        signal={"state": "ABOVE"}, team_consensus="unánime",
+        symbol="US500",
+        action=Action.LONG,
+        risk=RiskMode.COMPLETO,
+        confidence=80,
+        reasons=["test"],
+        key_levels={"high": 100.5, "low": 100.0},
+        signal={"state": "ABOVE"},
+        team_consensus="unánime",
     )
     if analyze_side_effect is not None:
         analyze_mock = MagicMock(side_effect=analyze_side_effect)
@@ -106,12 +124,22 @@ def _mock_stages(monkeypatch, analyze_side_effect=None):
             decision_id=1,
             orders=[
                 OrderContract(
-                    symbol="US500", side="BUY", volume=0.5, entry_price=100.5,
-                    stop_loss=100.0, take_profit=101.0, is_runner=False,
+                    symbol="US500",
+                    side="BUY",
+                    volume=0.5,
+                    entry_price=100.5,
+                    stop_loss=100.0,
+                    take_profit=101.0,
+                    is_runner=False,
                 ),
                 OrderContract(
-                    symbol="US500", side="BUY", volume=0.5, entry_price=100.5,
-                    stop_loss=100.0, take_profit=None, is_runner=True,
+                    symbol="US500",
+                    side="BUY",
+                    volume=0.5,
+                    entry_price=100.5,
+                    stop_loss=100.0,
+                    take_profit=None,
+                    is_runner=True,
                 ),
             ],
             errors=[],
@@ -146,7 +174,9 @@ def test_analyze_failure_marks_run_failed(monkeypatch):
     assert result.status == "failed"
     run = run_repo.get_run(result.run_id)
     assert run.status == "failed"
-    metrics = {m["stage"]: m["status"] for m in stage_metrics_repo.list_stage_metrics(result.run_id)}
+    metrics = {
+        m["stage"]: m["status"] for m in stage_metrics_repo.list_stage_metrics(result.run_id)
+    }
     assert metrics.get("s5_analyze") == "error"
 
 
@@ -184,8 +214,15 @@ def test_budget_seeded_from_today_blocks_analyze(monkeypatch):
     run_repo.finish_run("run-previo", "success")
     for i in range(4):
         trade_repo.insert_trade(
-            "run-previo", "US500", "BUY", 0.5, 5000.0, None, None,
-            is_runner=bool(i % 2), status="OPEN",
+            "run-previo",
+            "US500",
+            "BUY",
+            0.5,
+            5000.0,
+            None,
+            None,
+            is_runner=bool(i % 2),
+            status="OPEN",
         )
 
     result = orchestrator.run_pipeline()
@@ -214,10 +251,14 @@ def test_high_amplitude_symbol_skips_without_failed_run(monkeypatch):
     signal_mock = MagicMock()
 
     monkeypatch.setattr(
-        orchestrator, "stage_preprocess",
+        orchestrator,
+        "stage_preprocess",
         lambda inp, df_c: PreprocessOutput(
-            symbol=inp.symbol, box=wide_box, rsi_last=55.0,
-            volume_profile=None, box_candles=[],
+            symbol=inp.symbol,
+            box=wide_box,
+            rsi_last=55.0,
+            volume_profile=None,
+            box_candles=[],
         ),
     )
     monkeypatch.setattr(orchestrator, "stage_signal", signal_mock)
@@ -236,7 +277,8 @@ def test_high_amplitude_symbol_skips_without_failed_run(monkeypatch):
 def test_symbol_error_without_signals_marks_failed(monkeypatch):
     _mock_stages(monkeypatch)
     monkeypatch.setattr(
-        orchestrator, "stage_ingest",
+        orchestrator,
+        "stage_ingest",
         MagicMock(side_effect=ValueError("API caída")),
     )
     result = orchestrator.run_pipeline()
@@ -245,3 +287,24 @@ def test_symbol_error_without_signals_marks_failed(monkeypatch):
     assert any("API caída" in e for e in result.errors)
     run = run_repo.get_run(result.run_id)
     assert run.status == "failed"
+
+
+def test_primary_policy_can_reduce_instead_of_blocking() -> None:
+    signals = [{"symbol": "US100", "is_primary": False}]
+    active, confirmed = orchestrator.apply_primary_policy(signals, "US500", "size_reduction")
+    assert confirmed is False
+    assert active[0]["primary_confirmed"] is False
+
+    blocked, confirmed = orchestrator.apply_primary_policy(signals, "US500", "required")
+    assert confirmed is False
+    assert blocked == []
+
+
+def test_primary_policy_detects_primary_breakout() -> None:
+    signals = [
+        {"symbol": "US500", "is_primary": True},
+        {"symbol": "US100", "is_primary": False},
+    ]
+    active, confirmed = orchestrator.apply_primary_policy(signals, "US500", "size_reduction")
+    assert confirmed is True
+    assert all(item["primary_confirmed"] for item in active)

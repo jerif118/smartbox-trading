@@ -56,9 +56,7 @@ class PreprocessOutput(BaseModel):
         if v.high is None or v.low is None:
             raise ValueError(f"Box sin niveles (high={v.high}, low={v.low})")
         if v.high <= v.low:
-            raise ValueError(
-                f"Box inválida: high ({v.high}) <= low ({v.low})"
-            )
+            raise ValueError(f"Box inválida: high ({v.high}) <= low ({v.low})")
         if v.amplitude_pct is None:
             raise ValueError("Box sin amplitud calculada")
         if v.n_candles <= 0:
@@ -70,11 +68,16 @@ class PreprocessOutput(BaseModel):
 class ContextInput(BaseModel):
     date_str: str
     market_tz: str = "America/New_York"
+    reference_time: str | None = None
 
 
 class ContextOutput(BaseModel):
     macro_risk: Literal["LOW", "MEDIUM", "HIGH"]
     high_impact_events: list[dict]
+    provider_status: Literal["OK", "DEGRADED", "UNAVAILABLE"] = "OK"
+    providers_ok: list[str] = Field(default_factory=list)
+    providers_failed: list[str] = Field(default_factory=list)
+    nearest_event_minutes: float | None = None
 
 
 # ── Stage 4: Signal (breakout) ────────────────────────────────────────
@@ -85,6 +88,7 @@ class SignalInput(BaseModel):
     df_candles: pd.DataFrame
     box: Box
     primary: bool = False
+    max_age_minutes: int = Field(default=15, ge=1)
 
 
 class SignalOutput(BaseModel):
@@ -93,6 +97,7 @@ class SignalOutput(BaseModel):
     breakout_state: Literal["ABOVE", "BELOW", "INSIDE", "NONE"] | None
     candle_close: float | None
     signal_time: str | None
+    signal_age_minutes: float | None = None
 
 
 # ── Stage 5: Analyze (crew) ───────────────────────────────────────────
@@ -114,6 +119,7 @@ class SymbolCrewData(BaseModel):
 
     symbol: str
     is_primary: bool = False
+    primary_confirmed: bool = True
     market_tz: str = "America/New_York"
     breakout_signal: BreakoutSignalData
     caja: BoxLevelsData
@@ -132,11 +138,11 @@ ProposedDirection = Literal["LONG", "SHORT", "NO_OPERAR"]
 
 # Estados de riesgo explícitos. Se elimina "APPROVE" genérico/ambiguo.
 RiskDecision = Literal[
-    "APPROVE_TRADE",    # operar en la dirección propuesta
+    "APPROVE_TRADE",  # operar en la dirección propuesta
     "APPROVE_NO_TRADE",  # aprobado NO operar (el trader propuso NO_OPERAR)
-    "MODIFY",           # operar pero con ajustes (niveles/tamaño)
-    "NEED_DATA",        # faltan datos críticos → NO_OPERAR
-    "VETO",             # regla dura violada → NO_OPERAR
+    "MODIFY",  # operar pero con ajustes (niveles/tamaño)
+    "NEED_DATA",  # faltan datos críticos → NO_OPERAR
+    "VETO",  # regla dura violada → NO_OPERAR
 ]
 
 
@@ -145,7 +151,9 @@ class TraderAssessment(BaseModel):
 
     symbol: str
     proposed_direction: ProposedDirection
-    confluence_score: int = Field(ge=0, le=100)
+    # El score autoritativo se recalcula/inyecta determinista en s5_analyze; el
+    # LLM no necesita devolverlo (default 0 y se sobrescribe).
+    confluence_score: int = Field(default=0, ge=0, le=100)
     confidence: int = Field(default=0, ge=0, le=100)
     rsi: float | None = None
     vah: float | None = None
@@ -153,6 +161,7 @@ class TraderAssessment(BaseModel):
     poc: float | None = None
     breakout_state: str | None = None
     macro_risk: str | None = None
+    macro_provider_status: str | None = None
     mtf_alignment: str | None = None
     reasons: list[str] = Field(default_factory=list)
 
@@ -242,9 +251,11 @@ class OpenTradeContract(BaseModel):
     side: Literal["BUY", "SELL"]
     entry_price: float
     stop_loss: float | None = None
+    initial_stop_loss: float | None = None
     take_profit: float | None = None
     is_runner: bool = False
     broker_order_id: str | None = None
+    max_favorable_price: float | None = None
 
 
 class ManageInput(BaseModel):

@@ -77,7 +77,7 @@ def test_min_rr_default_matches_box_template(monkeypatch):
 
 
 def test_validate_credentials_openai_compatible_needs_url_and_key(monkeypatch):
-    monkeypatch.setenv("AGENT_MTFA_MODEL", "openai_compatible/mi-modelo")
+    monkeypatch.setenv("AGENT_TRADER_MODEL", "openai_compatible/mi-modelo")
     monkeypatch.delenv("OPENAI_COMPATIBLE_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_COMPATIBLE_API_KEY", raising=False)
     reset_settings_cache()

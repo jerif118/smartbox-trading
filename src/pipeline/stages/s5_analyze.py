@@ -32,11 +32,11 @@ from pydantic import BaseModel, ValidationError
 
 from application.agents.agents import build_risk_agent, build_trader_agent
 from application.agents.tools import (
-    AnalyzeBoxTool,
-    ConfluenceScoreTool,
     DrawdownGuardTool,
-    MultiTimeframeTool,
+    analyze_multi_timeframe,
 )
+from domain.signals.confluence import compute_confluence_score
+from domain.signals.mtf import mtf_alignment
 from domain.strategy.decision import Action, RiskMode
 from domain.symbols import is_allowed
 from infrastructure.config.settings import get_settings
@@ -50,11 +50,11 @@ from pipeline.contracts import (
     SymbolResult,
     TraderAssessment,
 )
-from utils.logger import get_logger
+from utils.logger import bind_log_context, get_logger
 
 log = get_logger(__name__)
 
-# Umbral duro de confluencia: por debajo, el trader no opera (regla del negocio).
+# Umbral conservador por defecto; el perfil ACTIVE lo baja mediante settings.
 MIN_CONFLUENCE = 60
 
 
@@ -69,14 +69,18 @@ def stage_analyze(input_data: AnalyzeInput, run_id: str) -> AnalyzeOutput:
     if ignored:
         log.warning("[analyze] símbolos ignorados (no permitidos): %s", ignored)
         event_repo.log_event(
-            run_id=run_id, agent="Desk_Manager", event_type="SYSTEM",
+            run_id=run_id,
+            agent="Desk_Manager",
+            event_type="SYSTEM",
             payload={"event": "symbols_ignored", "ignored": ignored},
         )
 
     symbol_names = [s.symbol for s in active]
     log.info("[analyze] símbolos activos: %s", symbol_names)
     event_repo.log_event(
-        run_id=run_id, agent="Desk_Manager", event_type="SYSTEM",
+        run_id=run_id,
+        agent="Desk_Manager",
+        event_type="SYSTEM",
         payload={"stage": "analyze", "symbols": symbol_names},
     )
 
@@ -87,10 +91,7 @@ def stage_analyze(input_data: AnalyzeInput, run_id: str) -> AnalyzeOutput:
     # ── Ramas concurrentes: una por símbolo, agentes/crew aislados ─────
     results: list[SymbolResult] = []
     with ThreadPoolExecutor(max_workers=len(active)) as pool:
-        futures = {
-            pool.submit(_analyze_symbol_branch, sd, settings, run_id): sd
-            for sd in active
-        }
+        futures = {pool.submit(_analyze_symbol_branch, sd, settings, run_id): sd for sd in active}
         for fut in as_completed(futures):
             sd = futures[fut]
             try:
@@ -98,49 +99,70 @@ def stage_analyze(input_data: AnalyzeInput, run_id: str) -> AnalyzeOutput:
             except Exception as e:  # noqa: BLE001 — barrera de la rama
                 log.error("[analyze] rama %s falló: %s", sd.symbol, e, exc_info=True)
                 event_repo.log_event(
-                    run_id=run_id, agent=f"Trader_{sd.symbol}", event_type="SYSTEM",
+                    run_id=run_id,
+                    agent=f"Trader_{sd.symbol}",
+                    event_type="SYSTEM",
                     payload={"event": "branch_error", "error": str(e)[:300]},
                 )
                 # Seguridad: una rama caída → NEED_DATA → NO_OPERAR.
                 results.append(_fallback_symbol_result(sd, f"rama falló: {e}"))
 
     # ── Consolidación determinista (Desk_Manager, sin delegación) ──────
-    output = consolidate(results, run_id)
+    output = consolidate(
+        results,
+        run_id,
+        min_confluence=settings.effective_min_confluence,
+        full_risk_confluence=settings.full_risk_confluence,
+    )
 
     event_repo.log_event(
-        run_id=run_id, agent="Desk_Manager", event_type="DECISION",
+        run_id=run_id,
+        agent="Desk_Manager",
+        event_type="DECISION",
         payload={"n_decisions": len(output.decisions)},
     )
     return output
 
 
 # ── Rama por símbolo ──────────────────────────────────────────────────
-def _analyze_symbol_branch(
-    sd: SymbolCrewData, settings: Any, run_id: str
-) -> SymbolResult:
+def _analyze_symbol_branch(sd: SymbolCrewData, settings: Any, run_id: str) -> SymbolResult:
     """Trader→Risk para UN símbolo, en su propio crew aislado."""
     symbol = sd.symbol
+    # Hilo del pool por símbolo: siembra el contexto de logs (run_id + símbolo).
+    bind_log_context(run_id=run_id, symbol=symbol)
     log.info("[analyze:%s] iniciando rama Trader→Risk", symbol)
 
-    # Instancias NUEVAS por rama (nunca compartidas entre threads).
-    trader_tools = [AnalyzeBoxTool(), ConfluenceScoreTool(), MultiTimeframeTool()]
+    # El Trader NO usa tools: las señales técnicas (confluence, MTF) se calculan
+    # deterministas y se le inyectan. El Risk sí usa drawdown_guard.
     risk_tools = [DrawdownGuardTool()]
-    trader = build_trader_agent(symbol, settings.llm, trader_tools)
+    trader = build_trader_agent(symbol, settings.llm, [])
     risk = build_risk_agent(symbol, settings.llm, risk_tools)
 
     sd_json = json.dumps(sd.model_dump(), default=str, ensure_ascii=False)
     strategy_levels = _strategy_levels(sd)
     strategy_levels_json = json.dumps(strategy_levels, ensure_ascii=False)
 
+    # ── Señales técnicas deterministas (una sola descarga de MTF) ──────────
+    state = (sd.breakout_signal.state or "").upper()
+    candidate = "LONG" if state == "ABOVE" else "SHORT" if state == "BELOW" else "LONG"
+    mtf = analyze_multi_timeframe(symbol, candidate)
+    pre_conf = _confluence_from_sd(sd, candidate, settings, mtf)
+
     trader_task = Task(
         description=(
-            f"Analiza SOLO el símbolo {symbol}. Datos de entrada (caja, breakout, "
+            f"Analiza SOLO el símbolo {symbol}. Datos de mercado (caja, breakout, "
             f"RSI, volume profile VAH/VAL/POC, macro):\n{sd_json}\n\n"
-            f"Usa confluence_score y multi_timeframe_analysis. "
-            f"Si el score < {MIN_CONFLUENCE} → proposed_direction = NO_OPERAR. "
-            f"Devuelve JSON con: symbol, proposed_direction (LONG/SHORT/NO_OPERAR), "
-            f"confluence_score (0-100), confidence (0-100), rsi, vah, val, poc, "
-            f"breakout_state, macro_risk, mtf_alignment, reasons (lista)."
+            f"Señales técnicas YA CALCULADAS (deterministas — úsalas como base):\n"
+            f"- confluence_score={pre_conf['score']} "
+            f"(factores: {pre_conf['factors']})\n"
+            f"- mtf_alignment={mtf.get('mtf_alignment')} "
+            f"(sesgos por timeframe: {mtf.get('tf_biases')})\n"
+            f"- breakout={state} → dirección implícita {candidate}\n\n"
+            f"Decide proposed_direction (LONG/SHORT/NO_OPERAR). Si el "
+            f"confluence_score < {settings.effective_min_confluence} o el contexto "
+            f"macro lo desaconseja, propon NO_OPERAR.\n"
+            f"Devuelve JSON con: symbol, proposed_direction, confidence (0-100), "
+            f"reasons (lista de razones de tu decisión)."
         ),
         agent=trader,
         expected_output="JSON TraderAssessment para el símbolo",
@@ -164,7 +186,10 @@ def _analyze_symbol_branch(
             f"MODIFY, NEED_DATA, VETO. Reglas:\n"
             f"- trader propone NO_OPERAR → APPROVE_NO_TRADE\n"
             f"- faltan datos críticos → NEED_DATA\n"
-            f"- macro_risk HIGH con evento cercano / drawdown excedido / R:R < min → VETO\n"
+            f"- macro_risk HIGH dentro del blackout / drawdown excedido / "
+            f"R:R < min / dirección contra breakout → VETO\n"
+            f"- macro MEDIUM, provider DEGRADED, MTF contrario o primary_confirmed=false "
+            f"→ MODIFY (medio tamaño), no VETO\n"
             f"- trader propone LONG/SHORT y todo OK → APPROVE_TRADE\n"
             f"- operar pero con ajuste de niveles → MODIFY (incluye suggested_stop_loss/"
             f"suggested_take_profit).\n"
@@ -191,24 +216,56 @@ def _analyze_symbol_branch(
     if trader_res is None:
         log.error("[analyze:%s] Trader no produjo JSON parseable", symbol)
         return _fallback_symbol_result(sd, "trader sin JSON válido")
-    # Normaliza el símbolo por si el LLM lo cambió.
+
+    # ── Integridad: TODOS los campos que S6 usa provienen de la fuente
+    #    determinista (stage 2/4 + dominio), NO del echo del LLM. El LLM solo
+    #    aporta proposed_direction, confidence y reasons. ───────────────────
     trader_res.symbol = symbol
+    trader_res.breakout_state = sd.breakout_signal.state  # ← S6 valida dirección con esto
+    trader_res.rsi = sd.rsi.get("last") if isinstance(sd.rsi, dict) else None
+    if isinstance(sd.vp, dict):
+        trader_res.vah = sd.vp.get("vah")
+        trader_res.val = sd.vp.get("val")
+        trader_res.poc = sd.vp.get("poc")
+    if isinstance(sd.macro, dict):
+        trader_res.macro_risk = sd.macro.get("risk")
+        trader_res.macro_provider_status = sd.macro.get("provider_status")
+    if trader_res.proposed_direction in ("LONG", "SHORT"):
+        # Alineación MTF y confluence para la dirección propuesta, reutilizando
+        # los sesgos ya descargados (sin segunda llamada a Capital).
+        biases = mtf.get("tf_biases") or {}
+        trader_res.mtf_alignment = (
+            mtf_alignment(biases, trader_res.proposed_direction)
+            if biases
+            else mtf.get("mtf_alignment")
+        )
+        trader_res.confluence_score = _authoritative_confluence(
+            sd, trader_res.proposed_direction, settings, mtf=mtf
+        )
+    else:
+        trader_res.mtf_alignment = mtf.get("mtf_alignment")
 
     if risk_res is None:
         log.error("[analyze:%s] Risk no produjo JSON parseable → NEED_DATA", symbol)
         risk_res = RiskAssessment(
-            symbol=symbol, risk_decision="NEED_DATA",
+            symbol=symbol,
+            risk_decision="NEED_DATA",
             reasons=["risk sin JSON válido → NO_OPERAR por seguridad"],
         )
     risk_res.symbol = symbol
 
     log.info(
         "[analyze:%s] trader=%s score=%d | risk=%s rr=%s",
-        symbol, trader_res.proposed_direction, trader_res.confluence_score,
-        risk_res.risk_decision, risk_res.rr_ratio,
+        symbol,
+        trader_res.proposed_direction,
+        trader_res.confluence_score,
+        risk_res.risk_decision,
+        risk_res.rr_ratio,
     )
     event_repo.log_event(
-        run_id=run_id, agent=f"Risk_{symbol}", event_type="DECISION",
+        run_id=run_id,
+        agent=f"Risk_{symbol}",
+        event_type="DECISION",
         payload={
             "proposed_direction": trader_res.proposed_direction,
             "confluence_score": trader_res.confluence_score,
@@ -220,19 +277,28 @@ def _analyze_symbol_branch(
 
 
 # ── Consolidación determinista (Desk_Manager) ─────────────────────────
-def consolidate(results: list[SymbolResult], run_id: str) -> AnalyzeOutput:
+def consolidate(
+    results: list[SymbolResult],
+    run_id: str,
+    *,
+    min_confluence: int = MIN_CONFLUENCE,
+    full_risk_confluence: int = 70,
+) -> AnalyzeOutput:
     """Combina trader+risk de cada símbolo en decisiones finales.
 
     Determinista y conservadora: ante cualquier duda, NO_OPERAR.
     """
     decisions: list[DecisionContract] = []
     for res in results:
-        decisions.append(_to_decision(res))
+        decisions.append(_to_decision(res, min_confluence, full_risk_confluence))
     return AnalyzeOutput(decisions=decisions)
 
 
 def map_final_action(
-    proposed_direction: str, confluence_score: int, risk_decision: str
+    proposed_direction: str,
+    confluence_score: int,
+    risk_decision: str,
+    min_confluence: int = MIN_CONFLUENCE,
 ) -> Action:
     """Mapeo seguro risk_decision → acción final. Fuente de verdad del bot.
 
@@ -241,7 +307,7 @@ def map_final_action(
     """
     if proposed_direction == "NO_OPERAR":
         return Action.NO_OPERAR
-    if confluence_score < MIN_CONFLUENCE:
+    if confluence_score < min_confluence:
         return Action.NO_OPERAR
     if risk_decision in ("VETO", "NEED_DATA", "APPROVE_NO_TRADE"):
         return Action.NO_OPERAR
@@ -251,16 +317,29 @@ def map_final_action(
     return Action.NO_OPERAR
 
 
-def _to_decision(res: SymbolResult) -> DecisionContract:
+def _to_decision(
+    res: SymbolResult, min_confluence: int = MIN_CONFLUENCE, full_risk_confluence: int = 70
+) -> DecisionContract:
     t, r = res.trader, res.risk
-    action = map_final_action(t.proposed_direction, t.confluence_score, r.risk_decision)
+    action = map_final_action(
+        t.proposed_direction, t.confluence_score, r.risk_decision, min_confluence
+    )
 
     # Riesgo MEDIO si hubo ajuste o macro alto; COMPLETO en caso normal.
-    risk_mode = RiskMode.MEDIO if (
-        r.risk_decision == "MODIFY" or (t.macro_risk or "").upper() == "HIGH"
-    ) else RiskMode.COMPLETO
+    risk_mode = (
+        RiskMode.MEDIO
+        if (
+            r.risk_decision == "MODIFY"
+            or (t.macro_risk or "").upper() in ("MEDIUM", "HIGH")
+            or (t.mtf_alignment or "").upper() in ("MIXED", "COUNTER")
+            or (t.macro_provider_status or "").upper() == "DEGRADED"
+            or t.confluence_score < full_risk_confluence
+        )
+        else RiskMode.COMPLETO
+    )
 
-    confidence = t.confidence or t.confluence_score
+    # confidence == confluence determinista (fuente única, no el número del LLM).
+    confidence = t.confluence_score
     if action == Action.NO_OPERAR:
         # Confianza alta en la decisión de no operar.
         confidence = max(confidence, 50)
@@ -276,7 +355,9 @@ def _to_decision(res: SymbolResult) -> DecisionContract:
 
     # key_levels/signal preservan TODO el contexto del trader (no se pierde nada).
     key_levels = {
-        "vah": t.vah, "val": t.val, "poc": t.poc,
+        "vah": t.vah,
+        "val": t.val,
+        "poc": t.poc,
         "suggested_stop_loss": r.suggested_stop_loss,
         "suggested_take_profit": r.suggested_take_profit,
     }
@@ -286,6 +367,7 @@ def _to_decision(res: SymbolResult) -> DecisionContract:
         "rsi": t.rsi,
         "breakout_state": t.breakout_state,
         "macro_risk": t.macro_risk,
+        "macro_provider_status": t.macro_provider_status,
         "mtf_alignment": t.mtf_alignment,
         "risk_decision": r.risk_decision,
         "rr_ratio": r.rr_ratio,
@@ -304,6 +386,48 @@ def _to_decision(res: SymbolResult) -> DecisionContract:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
+def _confluence_from_sd(
+    sd: SymbolCrewData, direction: str, settings: Any, mtf: dict | None = None
+) -> dict:
+    """Confluence determinista (dict con score/recommendation/factors) desde sd.
+
+    Deriva los inputs de sd (RSI, POC vs mid de la caja, breakout) + el MTF real.
+    ``mtf`` se puede pasar ya descargado para NO volver a llamar a Capital; la
+    alineación se recalcula desde sus sesgos para la ``direction`` pedida.
+    """
+    rsi_value = sd.rsi.get("last") if isinstance(sd.rsi, dict) else None
+    poc = sd.vp.get("poc") if isinstance(sd.vp, dict) else None
+    # Sin POC no se puede verificar la alineación → tratar como NO alineado.
+    poc_above_mid = (direction != "LONG") if poc is None else (poc > sd.caja.mid)
+
+    state = (sd.breakout_signal.state or "").upper()
+    breakout_aligned = (state == "ABOVE" and direction == "LONG") or (
+        state == "BELOW" and direction == "SHORT"
+    )
+
+    if mtf is None:
+        mtf = analyze_multi_timeframe(sd.symbol, direction)
+    biases = mtf.get("tf_biases") or {}
+    alignment = mtf_alignment(biases, direction) if biases else mtf.get("mtf_alignment", "MIXED")
+    mtf_aligned = alignment == "ALIGNED"
+
+    return compute_confluence_score(
+        direction=direction,
+        rsi_value=rsi_value,
+        poc_above_mid=poc_above_mid,
+        breakout_aligned=breakout_aligned,
+        mtf_aligned=mtf_aligned,
+        proceed_threshold=settings.effective_min_confluence,
+    )
+
+
+def _authoritative_confluence(
+    sd: SymbolCrewData, direction: str, settings: Any, mtf: dict | None = None
+) -> int:
+    """Score de confluencia autoritativo (int) para la dirección dada."""
+    return int(_confluence_from_sd(sd, direction, settings, mtf)["score"])
+
+
 def _parse_task_output(task: Task, model: type[BaseModel]) -> BaseModel | None:
     """Extrae el modelo Pydantic del output de una task (pydantic o raw JSON)."""
     out = getattr(task, "output", None)
@@ -379,11 +503,15 @@ def _fallback_symbol_result(sd: SymbolCrewData, reason: str) -> SymbolResult:
     return SymbolResult(
         symbol=sd.symbol,
         trader=TraderAssessment(
-            symbol=sd.symbol, proposed_direction="NO_OPERAR",
-            confluence_score=0, reasons=[reason],
+            symbol=sd.symbol,
+            proposed_direction="NO_OPERAR",
+            confluence_score=0,
+            reasons=[reason],
         ),
         risk=RiskAssessment(
-            symbol=sd.symbol, risk_decision="NEED_DATA", reasons=[reason],
+            symbol=sd.symbol,
+            risk_decision="NEED_DATA",
+            reasons=[reason],
         ),
     )
 
@@ -392,8 +520,13 @@ def _all_no_operar(symbols: list[SymbolCrewData], reason: str) -> AnalyzeOutput:
     return AnalyzeOutput(
         decisions=[
             DecisionContract(
-                symbol=s.symbol, action=Action.NO_OPERAR, risk=RiskMode.MEDIO,
-                confidence=50, reasons=[reason], key_levels={}, signal={},
+                symbol=s.symbol,
+                action=Action.NO_OPERAR,
+                risk=RiskMode.MEDIO,
+                confidence=50,
+                reasons=[reason],
+                key_levels={},
+                signal={},
                 team_consensus="no_op",
             )
             for s in symbols

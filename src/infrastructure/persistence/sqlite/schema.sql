@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS trades (
   volume REAL NOT NULL,
   entry_price REAL NOT NULL,
   stop_loss REAL,
+  initial_stop_loss REAL,                    -- stop original; base inmutable para R
   take_profit REAL,
   is_runner INTEGER NOT NULL DEFAULT 0,    -- 0 = primary, 1 = runner
   broker_order_id TEXT,
@@ -64,6 +65,7 @@ CREATE TABLE IF NOT EXISTS trades (
   exit_price REAL,
   pnl REAL,
   r_multiple REAL,                         -- (exit-entry)/(entry-SL) firmado
+  max_favorable_price REAL,                  -- máxima excursión favorable (high-water) para trailing
   reason TEXT,                             -- razón al cerrar
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -88,7 +90,7 @@ CREATE TABLE IF NOT EXISTS agent_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id TEXT NOT NULL,
   ts TEXT NOT NULL,
-  agent TEXT NOT NULL,                     -- decision_maker | trader | risk_analyst | mtfa | position_manager
+  agent TEXT NOT NULL,                     -- decision_maker | trader | risk_analyst | position_manager | orchestrator
   event_type TEXT NOT NULL,                -- THOUGHT | TOOL_CALL | TOOL_RESULT | MESSAGE | DECISION | SYSTEM
   payload TEXT,                            -- JSON
   duration_ms INTEGER,
