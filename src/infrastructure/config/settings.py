@@ -54,38 +54,19 @@ class LLMSettings(BaseSettings):
         populate_by_name=True,
     )
 
-    decision_maker: str = Field(
-        default="openai/gpt-4o-mini", alias="AGENT_DECISION_MAKER_MODEL"
-    )
+    # Únicos agentes LLM del flujo activo. La consolidación (Desk_Manager) y la
+    # gestión de posiciones son deterministas → no tienen modelo.
     trader: str = Field(default="openai/gpt-4o-mini", alias="AGENT_TRADER_MODEL")
     risk_analyst: str = Field(default="openai/gpt-4o-mini", alias="AGENT_RISK_ANALYST_MODEL")
-    mtfa: str = Field(default="openai/gpt-4o-mini", alias="AGENT_MTFA_MODEL")
-    position_manager: str = Field(
-        default="openai/gpt-4o-mini", alias="AGENT_POSITION_MANAGER_MODEL"
-    )
 
-    ollama_base_url: str = Field(
-        default="http://localhost:11434", alias="OLLAMA_BASE_URL"
-    )
-    lm_studio_base_url: str = Field(
-        default="http://localhost:1234/v1", alias="LM_STUDIO_BASE_URL"
-    )
-    openai_compatible_base_url: str = Field(
-        default="", alias="OPENAI_COMPATIBLE_BASE_URL"
-    )
+    ollama_base_url: str = Field(default="http://localhost:11434", alias="OLLAMA_BASE_URL")
+    lm_studio_base_url: str = Field(default="http://localhost:1234/v1", alias="LM_STUDIO_BASE_URL")
+    openai_compatible_base_url: str = Field(default="", alias="OPENAI_COMPATIBLE_BASE_URL")
     # Sin default "dummy": si se configura base_url sin key, validate_credentials
     # lo reporta en vez de mandar una key falsa a un servidor desconocido.
-    openai_compatible_api_key: str = Field(
-        default="", alias="OPENAI_COMPATIBLE_API_KEY"
-    )
+    openai_compatible_api_key: str = Field(default="", alias="OPENAI_COMPATIBLE_API_KEY")
 
-    @field_validator(
-        "decision_maker",
-        "trader",
-        "risk_analyst",
-        "mtfa",
-        "position_manager",
-    )
+    @field_validator("trader", "risk_analyst")
     @classmethod
     def validate_model_format(cls, v: str) -> str:
         if "/" not in v:
@@ -96,8 +77,7 @@ class LLMSettings(BaseSettings):
         provider, _model = v.split("/", 1)
         if provider not in SUPPORTED_PROVIDERS:
             raise ValueError(
-                f"Unknown provider {provider!r} in {v!r}. "
-                f"Supported: {SUPPORTED_PROVIDERS}"
+                f"Unknown provider {provider!r} in {v!r}. Supported: {SUPPORTED_PROVIDERS}"
             )
         return v
 
@@ -160,8 +140,24 @@ class Settings(BaseSettings):
     volume: float = Field(default=1.0, alias="VOLUME")
     max_orders_per_day: int = Field(default=4, alias="MAX_ORDERS_PER_DAY")
     min_rr_ratio: float = Field(default=1.0, alias="MIN_RR_RATIO")
-    min_confidence: int = Field(default=0, alias="MIN_CONFIDENCE", ge=0, le=100)
+    # Backstop en s6_execute (confidence < umbral → NO_OPERAR). Default alineado
+    # con active_min_confluence: como confidence == confluence determinista, esto
+    # no rechaza trades ya validados por el crew, pero cierra el hueco de dejar el
+    # gate en 0 si falta la env. Súbelo para ser más estricto que el crew.
+    min_confidence: int = Field(default=55, alias="MIN_CONFIDENCE", ge=0, le=100)
     max_daily_loss: float = Field(default=500.0, alias="MAX_DAILY_LOSS")
+    strategy_profile: Literal["conservative", "active"] = Field(
+        default="active", alias="STRATEGY_PROFILE"
+    )
+    active_min_confluence: int = Field(default=55, alias="ACTIVE_MIN_CONFLUENCE", ge=0, le=100)
+    full_risk_confluence: int = Field(default=70, alias="FULL_RISK_CONFLUENCE", ge=0, le=100)
+    signal_max_age_minutes: int = Field(default=15, alias="SIGNAL_MAX_AGE_MINUTES", ge=5, le=120)
+    primary_confirmation_mode: Literal["required", "size_reduction", "independent"] = Field(
+        default="size_reduction", alias="PRIMARY_CONFIRMATION_MODE"
+    )
+    macro_blackout_minutes: int = Field(default=15, alias="MACRO_BLACKOUT_MINUTES", ge=0, le=180)
+    macro_caution_minutes: int = Field(default=120, alias="MACRO_CAUTION_MINUTES", ge=1, le=720)
+    max_correlated_setups: int = Field(default=1, alias="MAX_CORRELATED_SETUPS", ge=1, le=2)
 
     # ── Seguridad ─────────────────────────────────────────────────────────
     dry_run: bool = Field(default=True, alias="DRY_RUN")
@@ -249,6 +245,13 @@ class Settings(BaseSettings):
 
         return resolve_primary(self.primary_symbol, self.symbol_list)
 
+    @property
+    def effective_min_confluence(self) -> int:
+        """Umbral del crew según el perfil, sin alterar MIN_CONFIDENCE final."""
+        if self.strategy_profile == "active":
+            return self.active_min_confluence
+        return 60
+
     def vp_window(self) -> tuple[str, str]:
         """Ventana de velas (UTC, ISO sin tz) para ingest/VP.
 
@@ -276,22 +279,18 @@ class Settings(BaseSettings):
         """
         problems: list[str] = []
 
-        agent_models = (
-            self.llm.decision_maker,
-            self.llm.trader,
-            self.llm.risk_analyst,
-            self.llm.mtfa,
-            self.llm.position_manager,
-        )
+        agent_models = (self.llm.trader, self.llm.risk_analyst)
         providers = {m.split("/", 1)[0] for m in agent_models}
         if "openai_compatible" in providers:
             if not self.llm.openai_compatible_base_url:
                 problems.append(
-                    "OPENAI_COMPATIBLE_BASE_URL vacío pero hay agentes con provider openai_compatible"
+                    "OPENAI_COMPATIBLE_BASE_URL vacío pero hay agentes con provider "
+                    "openai_compatible"
                 )
             if not self.llm.openai_compatible_api_key:
                 problems.append(
-                    "OPENAI_COMPATIBLE_API_KEY vacío pero hay agentes con provider openai_compatible"
+                    "OPENAI_COMPATIBLE_API_KEY vacío pero hay agentes con provider "
+                    "openai_compatible"
                 )
 
         if self.simple_reality.upper() not in ("DEMO", "LIVE"):

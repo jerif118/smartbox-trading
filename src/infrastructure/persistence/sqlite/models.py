@@ -47,6 +47,7 @@ class Trade:
     volume: float = 0.0
     entry_price: float = 0.0
     stop_loss: float | None = None
+    initial_stop_loss: float | None = None
     take_profit: float | None = None
     is_runner: bool = False
     broker_order_id: str | None = None
@@ -56,12 +57,15 @@ class Trade:
     exit_price: float | None = None
     pnl: float | None = None
     r_multiple: float | None = None
+    max_favorable_price: float | None = None
     reason: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {k: v for k, v in self.__dict__.items() if v is not None or k in {"is_runner", "status"}}
+        return {
+            k: v for k, v in self.__dict__.items() if v is not None or k in {"is_runner", "status"}
+        }
 
 
 @dataclass

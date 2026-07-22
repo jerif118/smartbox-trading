@@ -1,6 +1,6 @@
 # SmartBox Trading v2
 
-> Bot de trading automatizado para índices americanos (S&P 500, NASDAQ, DAX) basado en la estrategia de la "caja de apertura". Analiza el mercado con 5 agentes de IA, ejecuta órdenes en SimpleFX, y te muestra todo en un panel visual.
+> Bot de trading automatizado para índices americanos basado en la estrategia de la "caja de apertura". Combina reglas deterministas con agentes Trader/Risk, ejecuta órdenes en SimpleFX y muestra todo en un panel visual.
 
 ---
 
@@ -31,13 +31,13 @@ El bot corre una vez al día, antes de la apertura de la bolsa de Nueva York. Su
 2. Calcula la "caja" de precios: high/low/amplitud entre 08:00-09:55 NY
 3. Si la amplitud > 1%  → no opera
 4. Monitorea 2 horas post-caja esperando un breakout
-5. Cuando hay breakout, 5 agentes de IA debaten:
-   - 👑 Jefe de mesa    — decide al final
-   - 📊 Trader           — analiza el setup
-   - 🛡️ Risk analyst    — el escéptico
-   - 🔭 Multi-timeframe  — confirma la tendencia grande
-   - 🛠️ Position manager — gestiona trades abiertos
-6. Si hay consenso → envía 2 órdenes (primary + runner)
+5. Cuando hay breakout vigente, Trader y Risk evalúan el setup:
+   - 📊 Trader — score direccional, RSI, VP y multi-timeframe
+   - 🛡️ Risk — veta solo reglas duras; incertidumbre moderada reduce tamaño
+   - 👑 Desk Manager — consolidación determinista, sin otra llamada LLM
+6. Si se aprueba → envía 2 órdenes (primary + runner)
+   - primary con TP fijo
+   - runner con breakeven en +1R y trailing desde +2R
 7. Persiste todo en SQLite para que lo veas en el panel
 ```
 
@@ -253,7 +253,7 @@ Programa la tarea en **Programador de tareas** de Windows a las 7:50 AM.
 | Variable | Default | Descripción |
 |---|---|---|
 | `SYMBOLS` | `US500,US100,DE40` | Símbolos a operar (CSV) |
-| `PRIMARY_SYMBOL` | `US500` | El bot espera el breakout de este símbolo antes de decidir |
+| `PRIMARY_SYMBOL` | `US500` | Símbolo usado como confirmación del resto |
 | `BOX_START` | `08:00` | Inicio de la caja (hora NY) |
 | `BOX_END` | `09:55` | Fin de la caja |
 | `VP_LOOKBACK_DAYS` | `3` | Días de velas a descargar (ventana móvil hasta ahora) |
@@ -261,7 +261,15 @@ Programa la tarea en **Programador de tareas** de Windows a las 7:50 AM.
 | `VOLUME` | `1.0` | Volumen base (se divide 50/50 entre 2 órdenes) |
 | `MAX_ORDERS_PER_DAY` | `4` | Hard cap de órdenes por día |
 | `MIN_RR_RATIO` | `1.0` | R:R mínimo (los templates producen 1.0) |
-| `MIN_CONFIDENCE` | `60` | Confianza mínima del crew para enviar órdenes |
+| `MIN_CONFIDENCE` | `55` | Confianza mínima final para enviar órdenes |
+| `STRATEGY_PROFILE` | `active` | `active` permite setups 55–69 a medio tamaño |
+| `ACTIVE_MIN_CONFLUENCE` | `55` | Score mínimo del perfil activo |
+| `FULL_RISK_CONFLUENCE` | `70` | Desde este score puede usar tamaño completo |
+| `PRIMARY_CONFIRMATION_MODE` | `size_reduction` | Sin US500 reduce tamaño; también admite `required`/`independent` |
+| `SIGNAL_MAX_AGE_MINUTES` | `15` | Descarta el primer breakout cuando ya quedó obsoleto |
+| `MACRO_BLACKOUT_MINUTES` | `15` | Veto antes/después de evento HIGH inmediato |
+| `MACRO_CAUTION_MINUTES` | `120` | Ventana de medio tamaño alrededor de eventos HIGH |
+| `MAX_CORRELATED_SETUPS` | `1` | Evita duplicar exposición US500/US100 en el mismo run |
 | `DRY_RUN` | `true` | Si `true`, NO envía órdenes |
 | `SIMPLE_REALITY` | `DEMO` | `DEMO` o `LIVE` |
 | `DB_PATH` | `./data/smartbox.db` | Path de la base de datos |
@@ -283,6 +291,19 @@ La tabla `stage_metrics` registra duración y resultado (`ok | error | timeout`)
 de cada stage en cada run — útil para ver qué parte del pipeline falla o tarda.
 El schema se versiona con `PRAGMA user_version`; las migraciones se aplican
 solas al arrancar (no hace falta borrar la DB al actualizar).
+
+### Calendario macro público
+
+El bot combina tres fuentes oficiales sin API key:
+
+- BLS ICS: CPI, PPI, empleo, JOLTS y comunicados laborales.
+- BEA JSON: GDP, PCE, comercio y otras publicaciones económicas.
+- Federal Reserve: día de decisión del FOMC a las 14:00 New York.
+
+El resultado diferencia `OK`, `DEGRADED` y `UNAVAILABLE`. Una respuesta vacía
+válida significa que no hay eventos; una caída de red nunca se interpreta como
+riesgo bajo. `HIGH` se reserva para el blackout inmediato y `MEDIUM` reduce el
+tamaño durante la ventana de cautela.
 
 ### Múltiples modelos de IA (uno por agente)
 
@@ -414,7 +435,7 @@ AGENT_MTFA_MODEL=ollama/llama3.1
 ### Correr tests
 
 ```bash
-# Todos (199 tests)
+# Todos (294+ tests)
 ./.venv/bin/python -m pytest tests/
 
 # Solo dominio (puros, sin I/O, ~0.3s)

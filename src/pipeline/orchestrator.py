@@ -30,10 +30,11 @@ from typing import Any
 from domain.market_time import box_window_unix
 from domain.strategy.box import MAX_AMPLITUDE_PCT
 from domain.strategy.budget import DailyOrderBudget
+from domain.strategy.decision import Action, RiskMode
 from infrastructure.broker.capital.adapter import CapitalAdapter
 from infrastructure.broker.simplefx.adapter import SimpleFXAdapter
 from infrastructure.config.settings import get_settings
-from infrastructure.persistence.sqlite import db, run_repo, trade_repo
+from infrastructure.persistence.sqlite import db, event_repo, run_repo, trade_repo
 from infrastructure.persistence.sqlite.equity_repo import insert_snapshot
 from pipeline.contracts import (
     AnalyzeInput,
@@ -55,7 +56,7 @@ from pipeline.stages.s4_signal import stage_signal
 from pipeline.stages.s5_analyze import stage_analyze
 from pipeline.stages.s6_execute import reconcile_pending_trades, stage_execute
 from pipeline.stages.s7_manage import stage_manage
-from utils.logger import get_logger
+from utils.logger import bind_log_context, get_logger, log_context, reset_log_context
 
 log = get_logger(__name__)
 
@@ -65,6 +66,7 @@ BREAKOUT_WINDOW_SECONDS = 2 * 3600
 
 def _is_weekend(date_str: str) -> bool:
     from datetime import datetime as dt
+
     try:
         d = dt.strptime(date_str[:10], "%Y-%m-%d")
         return d.weekday() >= 5
@@ -74,7 +76,44 @@ def _is_weekend(date_str: str) -> bool:
 
 def _today_str(tz: str = "America/New_York") -> str:
     from zoneinfo import ZoneInfo
+
     return datetime.now(ZoneInfo(tz)).strftime("%Y-%m-%d")
+
+
+def apply_primary_policy(
+    symbols_data: list[dict[str, Any]], primary_symbol: str, mode: str
+) -> tuple[list[dict[str, Any]], bool]:
+    """Aplica la política de confirmación sin esconder señales secundarias.
+
+    ``required`` bloquea; ``size_reduction`` conserva la señal y la marca para
+    medio tamaño; ``independent`` solo registra el estado.
+    """
+    confirmed = any(
+        item.get("symbol") == primary_symbol and item.get("is_primary") for item in symbols_data
+    )
+    enriched = [{**item, "primary_confirmed": confirmed} for item in symbols_data]
+    if not confirmed and mode == "required":
+        return [], False
+    return enriched, confirmed
+
+
+def _persist_full_errors(run_id: str, errors: list[str]) -> None:
+    """Guarda la lista COMPLETA de errores como evento SYSTEM.
+
+    ``runs.error`` se trunca a 500 chars; este evento conserva el detalle
+    íntegro para el post-mortem (``smartbox diagnose <run_id>``).
+    """
+    if not errors:
+        return
+    try:
+        event_repo.log_event(
+            run_id=run_id,
+            agent="orchestrator",
+            event_type="SYSTEM",
+            payload={"event": "run_errors", "count": len(errors), "errors": errors},
+        )
+    except Exception as e:  # noqa: BLE001 — best-effort, no debe tumbar el cierre
+        log.warning("No se pudo persistir la lista completa de errores: %s", e)
 
 
 def run_pipeline() -> RunResult:
@@ -88,6 +127,7 @@ def run_pipeline() -> RunResult:
 
     run_id = str(uuid.uuid4())
     started_at = datetime.now(UTC).isoformat()
+    _log_token = bind_log_context(run_id=run_id)
     errors: list[str] = []
     orders_sent = 0
     decisions_count = 0
@@ -101,11 +141,8 @@ def run_pipeline() -> RunResult:
         "min_rr_ratio": settings.min_rr_ratio,
         "dry_run": settings.dry_run,
         "models": {
-            "decision_maker": settings.llm.decision_maker,
             "trader": settings.llm.trader,
             "risk_analyst": settings.llm.risk_analyst,
-            "mtfa": settings.llm.mtfa,
-            "position_manager": settings.llm.position_manager,
         },
     }
     run_repo.start_run(run_id, config_snap)
@@ -162,8 +199,11 @@ def run_pipeline() -> RunResult:
 
         try:
             n_actions = run_stage(
-                "s7_manage", run_id, _manage_open_positions,
+                "s7_manage",
+                run_id,
+                _manage_open_positions,
                 timeout_s=settings.stage_timeout_s,
+                side_effecting=True,
             )
             if n_actions:
                 log.info("PM: %d acciones sobre trades abiertos", n_actions)
@@ -172,18 +212,32 @@ def run_pipeline() -> RunResult:
             errors.append(str(e))
 
         # ── STAGES 1-4 por símbolo (paralelo) ──────────────────────────
-        log.info("STAGES 1-4 · Ingest + Preprocess + Signal (%d símbolos)", len(settings.symbol_list))
+        log.info(
+            "STAGES 1-4 · Ingest + Preprocess + Signal (%d símbolos)", len(settings.symbol_list)
+        )
         box_date = settings.box_date or today
         start_iso, end_iso = settings.vp_window()
-        log.info("Ventana de datos (UTC): %s → %s | caja %s %s-%s (%s)",
-                 start_iso, end_iso, box_date, settings.box_start, settings.box_end, settings.market_tz)
+        log.info(
+            "Ventana de datos (UTC): %s → %s | caja %s %s-%s (%s)",
+            start_iso,
+            end_iso,
+            box_date,
+            settings.box_start,
+            settings.box_end,
+            settings.market_tz,
+        )
         symbols_data: list[dict[str, Any]] = []
 
         def process_symbol(sym: str) -> dict[str, Any] | None:
+            # Hilo del pool por símbolo: siembra el contexto de logs. El pool se
+            # cierra al terminar el run, así que no requiere reset explícito.
+            bind_log_context(run_id=run_id, symbol=sym)
             try:
                 # Stage 1
                 ingest_out = run_stage(
-                    f"s1_ingest:{sym}", run_id, stage_ingest,
+                    f"s1_ingest:{sym}",
+                    run_id,
+                    stage_ingest,
                     IngestInput(
                         symbol=sym,
                         start_iso=start_iso,
@@ -208,18 +262,27 @@ def run_pipeline() -> RunResult:
                     market_tz=settings.market_tz,
                 )
                 pp_out = run_stage(
-                    f"s2_preprocess:{sym}", run_id, stage_preprocess,
-                    pp_in, ingest_out.df_candles,
+                    f"s2_preprocess:{sym}",
+                    run_id,
+                    stage_preprocess,
+                    pp_in,
+                    ingest_out.df_candles,
                     timeout_s=settings.stage_timeout_s,
                 )
                 log.info(
                     "[preprocess] %s: box=%.2f-%.2f amp=%.2f%% RSI=%s",
-                    sym, pp_out.box.low, pp_out.box.high, pp_out.box.amplitude_pct, pp_out.rsi_last,
+                    sym,
+                    pp_out.box.low,
+                    pp_out.box.high,
+                    pp_out.box.amplitude_pct,
+                    pp_out.rsi_last,
                 )
                 if not pp_out.box.is_valid():
                     log.info(
                         "[preprocess] %s: amplitud %.2f%% > %.2f%% -> NO_OPERAR",
-                        sym, pp_out.box.amplitude_pct, MAX_AMPLITUDE_PCT,
+                        sym,
+                        pp_out.box.amplitude_pct,
+                        MAX_AMPLITUDE_PCT,
                     )
                     return None
 
@@ -229,8 +292,7 @@ def run_pipeline() -> RunResult:
                 )
                 df = ingest_out.df_candles
                 post_box = df[
-                    (df["time"] > box_to)
-                    & (df["time"] <= box_to + BREAKOUT_WINDOW_SECONDS)
+                    (df["time"] > box_to) & (df["time"] <= box_to + BREAKOUT_WINDOW_SECONDS)
                 ]
                 if post_box.empty:
                     log.info("[signal] %s: sin velas post-caja todavía", sym)
@@ -241,19 +303,30 @@ def run_pipeline() -> RunResult:
                     df_candles=post_box,
                     box=pp_out.box,
                     primary=(sym == settings.primary_symbol_resolved),
+                    max_age_minutes=settings.signal_max_age_minutes,
                 )
                 sig_out = run_stage(
-                    f"s4_signal:{sym}", run_id, stage_signal, sig_in,
+                    f"s4_signal:{sym}",
+                    run_id,
+                    stage_signal,
+                    sig_in,
                     timeout_s=settings.stage_timeout_s,
                 )
 
                 if not sig_out.has_breakout:
-                    log.info("[signal] %s: sin breakout", sym)
+                    log.info(
+                        "[signal] %s: sin breakout vigente (age=%s min)",
+                        sym,
+                        sig_out.signal_age_minutes,
+                    )
                     return None
 
                 log.info(
                     "[signal] %s: BREAKOUT %s close=%.2f @ %s",
-                    sym, sig_out.breakout_state, sig_out.candle_close, sig_out.signal_time,
+                    sym,
+                    sig_out.breakout_state,
+                    sig_out.candle_close,
+                    sig_out.signal_time,
                 )
 
                 return {
@@ -266,6 +339,7 @@ def run_pipeline() -> RunResult:
                     "breakout_state": sig_out.breakout_state,
                     "candle_close": sig_out.candle_close,
                     "signal_time": sig_out.signal_time,
+                    "signal_age_minutes": sig_out.signal_age_minutes,
                 }
             except StageError as e:
                 # run_stage ya logueó con stack trace y persistió la métrica
@@ -281,13 +355,15 @@ def run_pipeline() -> RunResult:
                     if data is not None:
                         symbols_data.append(data)
                 except Exception as e:  # noqa: BLE001 — barrera del thread (bug inesperado)
-                    log.error("[pipeline] %s: error inesperado fuera de stage: %s",
-                              sym, e, exc_info=True)
+                    log.error(
+                        "[pipeline] %s: error inesperado fuera de stage: %s", sym, e, exc_info=True
+                    )
                     errors.append(f"{sym}: {e}")
 
         if not symbols_data:
             if errors:
                 log.warning("[FIN] Sin señales y con errores: %s", "; ".join(errors))
+                _persist_full_errors(run_id, errors)
                 run_repo.finish_run(run_id, "failed", "; ".join(errors)[:500])
                 final_status = "failed"
             else:
@@ -295,9 +371,39 @@ def run_pipeline() -> RunResult:
                 run_repo.finish_run(run_id, "success", "no breakouts")
                 final_status = "success"
             return RunResult(
-                run_id=run_id, started_at=started_at,
+                run_id=run_id,
+                started_at=started_at,
                 finished_at=datetime.now(UTC).isoformat(),
                 status=final_status,
+                errors=errors,
+            )
+
+        symbols_data, primary_confirmed = apply_primary_policy(
+            symbols_data,
+            settings.primary_symbol_resolved,
+            settings.primary_confirmation_mode,
+        )
+        if not symbols_data and settings.primary_confirmation_mode == "required":
+            log.info(
+                "[FIN] %s sin breakout: confirmación primaria obligatoria",
+                settings.primary_symbol_resolved,
+            )
+            event_repo.log_event(
+                run_id=run_id,
+                agent="desk_manager",
+                event_type="DECISION",
+                payload={
+                    "action": "NO_OPERAR",
+                    "reason": "primary_breakout_required",
+                    "primary_symbol": settings.primary_symbol_resolved,
+                },
+            )
+            run_repo.finish_run(run_id, "success", "primary breakout required")
+            return RunResult(
+                run_id=run_id,
+                started_at=started_at,
+                finished_at=datetime.now(UTC).isoformat(),
+                status="success",
                 errors=errors,
             )
 
@@ -305,8 +411,17 @@ def run_pipeline() -> RunResult:
         log.info("STAGE 3 · Context (macro)")
         try:
             ctx_out = run_stage(
-                "s3_context", run_id, stage_context,
-                ContextInput(date_str=today, market_tz=settings.market_tz),
+                "s3_context",
+                run_id,
+                stage_context,
+                ContextInput(
+                    date_str=box_date,
+                    market_tz=settings.market_tz,
+                    reference_time=max(
+                        (s["signal_time"] for s in symbols_data if s["signal_time"]),
+                        default=None,
+                    ),
+                ),
                 timeout_s=settings.stage_timeout_s,
             )
         except StageError as e:
@@ -315,19 +430,25 @@ def run_pipeline() -> RunResult:
             errors.append(str(e))
             ctx_out = ContextOutput(macro_risk="HIGH", high_impact_events=[])
             log.warning("Contexto macro no disponible → macro_risk=HIGH (fail-safe)")
-        log.info("Macro risk: %s (%d eventos HIGH)", ctx_out.macro_risk, len(ctx_out.high_impact_events))
+        log.info(
+            "Macro risk: %s (%d eventos HIGH)", ctx_out.macro_risk, len(ctx_out.high_impact_events)
+        )
 
         # ── Budget diario ANTES del crew, sembrado con lo ya enviado hoy ─
         used_today = trade_repo.count_orders_today()
         budget = DailyOrderBudget(max_orders=settings.max_orders_per_day, used=used_today)
         if used_today:
-            log.info("Budget diario: %d/%d órdenes ya usadas hoy",
-                     used_today, settings.max_orders_per_day)
+            log.info(
+                "Budget diario: %d/%d órdenes ya usadas hoy",
+                used_today,
+                settings.max_orders_per_day,
+            )
         if budget.remaining == 0:
             log.warning("[FIN] Budget diario agotado (%d órdenes hoy) — no se analiza", used_today)
             run_repo.finish_run(run_id, "success", "daily budget exhausted")
             return RunResult(
-                run_id=run_id, started_at=started_at,
+                run_id=run_id,
+                started_at=started_at,
                 finished_at=datetime.now(UTC).isoformat(),
                 status="success",
                 errors=errors,
@@ -342,6 +463,7 @@ def run_pipeline() -> RunResult:
                 {
                     "symbol": sd["symbol"],
                     "is_primary": sd["is_primary"],
+                    "primary_confirmed": sd["primary_confirmed"],
                     "market_tz": settings.market_tz,
                     "breakout_signal": {
                         "state": sd["breakout_state"],
@@ -359,13 +481,19 @@ def run_pipeline() -> RunResult:
                     "macro": {
                         "risk": ctx_out.macro_risk,
                         "events": ctx_out.high_impact_events[:5],
+                        "provider_status": ctx_out.provider_status,
+                        "nearest_event_minutes": ctx_out.nearest_event_minutes,
                     },
                 }
             )
 
         analyze_in = AnalyzeInput(symbols=crew_symbols_data, market=settings.market)
         analyze_out = run_stage(
-            "s5_analyze", run_id, stage_analyze, analyze_in, run_id,
+            "s5_analyze",
+            run_id,
+            stage_analyze,
+            analyze_in,
+            run_id,
             timeout_s=settings.analyze_timeout_s,
         )
         decisions_count = len(analyze_out.decisions)
@@ -374,11 +502,67 @@ def run_pipeline() -> RunResult:
         # ── STAGE 6: Execute ───────────────────────────────────────────
         log.info("STAGE 6 · Execute")
         trade_date = datetime.now(UTC).date().isoformat()
-        for decision in analyze_out.decisions:
+        ordered_decisions = sorted(
+            analyze_out.decisions,
+            key=lambda d: (
+                d.symbol != settings.primary_symbol_resolved,
+                -int(d.signal.get("confluence_score", d.confidence)),
+            ),
+        )
+        correlated_setups = trade_repo.count_setups_today()
+        for decision in ordered_decisions:
             # encontrar el Box del símbolo
             sym_data = next((s for s in symbols_data if s["symbol"] == decision.symbol), None)
             if sym_data is None:
                 continue
+            if decision.action != Action.NO_OPERAR:
+                if ctx_out.macro_risk == "HIGH":
+                    log.info(
+                        "[execute] %s vetado por blackout macro (%s min)",
+                        decision.symbol,
+                        ctx_out.nearest_event_minutes,
+                    )
+                    event_repo.log_event(
+                        run_id=run_id,
+                        agent="desk_manager",
+                        event_type="DECISION",
+                        payload={
+                            "symbol": decision.symbol,
+                            "action": "NO_OPERAR",
+                            "reason": "macro_blackout",
+                            "nearest_event_minutes": ctx_out.nearest_event_minutes,
+                            "provider_status": ctx_out.provider_status,
+                        },
+                    )
+                    continue
+                if ctx_out.macro_risk == "MEDIUM":
+                    decision.risk = RiskMode.MEDIO
+                    decision.reasons.append("contexto macro MEDIUM: medio tamaño")
+                if (
+                    not primary_confirmed
+                    and decision.symbol != settings.primary_symbol_resolved
+                    and settings.primary_confirmation_mode == "size_reduction"
+                ):
+                    decision.risk = RiskMode.MEDIO
+                    decision.reasons.append("sin confirmación del US500: medio tamaño")
+                if correlated_setups >= settings.max_correlated_setups:
+                    log.info(
+                        "[execute] %s omitido por límite de exposición correlacionada",
+                        decision.symbol,
+                    )
+                    event_repo.log_event(
+                        run_id=run_id,
+                        agent="desk_manager",
+                        event_type="DECISION",
+                        payload={
+                            "symbol": decision.symbol,
+                            "action": "NO_OPERAR",
+                            "reason": "correlated_exposure_limit",
+                            "setups_today": correlated_setups,
+                            "max_correlated_setups": settings.max_correlated_setups,
+                        },
+                    )
+                    continue
 
             exec_in = ExecuteInput(
                 decision=decision,
@@ -390,21 +574,32 @@ def run_pipeline() -> RunResult:
             )
             try:
                 exec_out = run_stage(
-                    f"s6_execute:{decision.symbol}", run_id, stage_execute,
-                    exec_in, run_id, budget, broker,
+                    f"s6_execute:{decision.symbol}",
+                    run_id,
+                    stage_execute,
+                    exec_in,
+                    run_id,
+                    budget,
+                    broker,
                     timeout_s=settings.stage_timeout_s,
+                    side_effecting=True,
                 )
             except StageError as e:
                 # una decisión fallida no aborta las siguientes
                 errors.append(str(e))
                 continue
             orders_sent += len(exec_out.orders)
+            if exec_out.orders:
+                correlated_setups += 1
             if exec_out.errors:
                 log.warning("[execute] %s: %s", decision.symbol, "; ".join(exec_out.errors))
                 errors.extend(exec_out.errors)
             if exec_out.skipped:
-                log.info("[execute] %s: %d orden(es) saltadas por idempotencia",
-                         decision.symbol, len(exec_out.skipped))
+                log.info(
+                    "[execute] %s: %d orden(es) saltadas por idempotencia",
+                    decision.symbol,
+                    len(exec_out.skipped),
+                )
 
         # ── Equity snapshot (P&L computado desde trades; no hay endpoint
         #    de balance en el broker — source='computed') ────────────────
@@ -424,9 +619,16 @@ def run_pipeline() -> RunResult:
             log.warning("No se pudo guardar equity snapshot: %s", e)
 
         status = "success" if not errors else "partial"
+        _persist_full_errors(run_id, errors)
         run_repo.finish_run(run_id, status, "; ".join(errors)[:500] if errors else None)
         log.info("═" * 60)
-        log.info("RUN %s FINALIZADO — status=%s, decisions=%d, orders=%d", run_id, status, decisions_count, orders_sent)
+        log.info(
+            "RUN %s FINALIZADO — status=%s, decisions=%d, orders=%d",
+            run_id,
+            status,
+            decisions_count,
+            orders_sent,
+        )
         log.info("═" * 60)
 
         return RunResult(
@@ -441,6 +643,7 @@ def run_pipeline() -> RunResult:
 
     except StageError as e:
         log.critical("Stage crítico falló: %s", e)
+        _persist_full_errors(run_id, [*errors, str(e)])
         run_repo.finish_run(run_id, "failed", str(e)[:500])
         return RunResult(
             run_id=run_id,
@@ -451,6 +654,7 @@ def run_pipeline() -> RunResult:
         )
     except Exception as e:  # noqa: BLE001 — última barrera: bug fuera de stages
         log.critical("Error en run: %s", e, exc_info=True)
+        _persist_full_errors(run_id, [*errors, str(e)])
         run_repo.finish_run(run_id, "failed", str(e)[:500])
         return RunResult(
             run_id=run_id,
@@ -471,3 +675,4 @@ def run_pipeline() -> RunResult:
                 log.warning("Run %s cerrado como failed en finally (aborted)", run_id)
         except Exception as e:  # noqa: BLE001 — best-effort
             log.error("No se pudo cerrar el run en finally: %s", e)
+        reset_log_context(_log_token)

@@ -6,12 +6,141 @@ de seguridad "ante la duda, NO_OPERAR".
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import pytest
 
 from domain.strategy.decision import Action, RiskMode
-from pipeline.contracts import RiskAssessment, SymbolResult, TraderAssessment
-from pipeline.contracts import AnalyzeInput, SymbolCrewData
-from pipeline.stages.s5_analyze import consolidate, map_final_action, _strategy_levels
+from pipeline.contracts import (
+    AnalyzeInput,
+    RiskAssessment,
+    SymbolCrewData,
+    SymbolResult,
+    TraderAssessment,
+)
+from pipeline.stages.s5_analyze import (
+    _authoritative_confluence,
+    _strategy_levels,
+    consolidate,
+    map_final_action,
+)
+
+
+def _crew_data(state: str, poc: float, rsi: float | None = 50.0) -> SymbolCrewData:
+    return AnalyzeInput(
+        symbols=[
+            {
+                "symbol": "US500",
+                "breakout_signal": {"state": state, "close": 7488.0},
+                "caja": {"high": 7482.4, "low": 7449.5, "mid": 7465.95, "amp_pct": 0.44},
+                "vp": {"poc": poc},
+                "rsi": {"last": rsi},
+            }
+        ]
+    ).symbols[0]
+
+
+def test_authoritative_confluence_ignores_llm_and_uses_real_data() -> None:
+    """A: el score se deriva de los datos reales, no del número del LLM.
+
+    Datos favorables a LONG (breakout ABOVE, POC sobre el mid, MTF ALIGNED) →
+    score alto calculado en Python, con independencia de lo que reportara el LLM.
+    """
+    settings = SimpleNamespace(effective_min_confluence=55)
+    sd = _crew_data(state="ABOVE", poc=7470.0)  # poc > mid(7465.95)
+    with patch("pipeline.stages.s5_analyze.analyze_multi_timeframe",
+               return_value={"mtf_alignment": "ALIGNED"}):
+        score = _authoritative_confluence(sd, "LONG", settings)
+    # RSI neutral(20)+POC(25)+breakout(30)+MTF(25) = 100
+    assert score == 100
+
+
+def test_authoritative_confluence_reuses_precomputed_mtf(monkeypatch) -> None:
+    """B: si se pasa el mtf ya descargado, NO se vuelve a llamar a Capital."""
+    import pipeline.stages.s5_analyze as s5
+
+    calls = {"n": 0}
+
+    def _fake_mtf(*_a, **_k):
+        calls["n"] += 1
+        return {"mtf_alignment": "ALIGNED", "tf_biases": {}}
+
+    monkeypatch.setattr(s5, "analyze_multi_timeframe", _fake_mtf)
+    sd = _crew_data(state="ABOVE", poc=7470.0)
+    settings = SimpleNamespace(effective_min_confluence=55)
+    precomputed = {
+        "mtf_alignment": "ALIGNED",
+        "tf_biases": {"15min": "BULLISH", "1h": "BULLISH", "4h": "NEUTRAL"},
+    }
+    s5._authoritative_confluence(sd, "LONG", settings, mtf=precomputed)
+    assert calls["n"] == 0
+
+
+def test_branch_normalizes_deterministic_fields(monkeypatch) -> None:
+    """A: el branch sobrescribe con el dato REAL lo que el LLM alucina.
+
+    El Trader devuelve breakout_state=BELOW y confluence_score=99, pero el
+    breakout real (sd) es ABOVE → el resultado usa ABOVE y recalcula el score.
+    """
+    import pipeline.stages.s5_analyze as s5
+
+    sd = _crew_data(state="ABOVE", poc=7470.0)  # breakout real ABOVE, poc > mid
+    settings = SimpleNamespace(
+        effective_min_confluence=55,
+        min_rr_ratio=1.0,
+        max_daily_loss=500.0,
+        llm=SimpleNamespace(trader="openai/x", risk_analyst="openai/x"),
+    )
+    fake_trader = TraderAssessment(
+        symbol="US500",
+        proposed_direction="LONG",
+        confluence_score=99,  # inflado
+        breakout_state="BELOW",  # alucinado (contrario al real)
+        reasons=["x"],
+    )
+    fake_risk = RiskAssessment(symbol="US500", risk_decision="APPROVE_TRADE", rr_ratio=1.0)
+
+    # El branch siembra el contexto de logs del hilo (en prod el hilo del pool se
+    # destruye); en el hilo de pytest hay que evitar que se filtre a otros tests.
+    monkeypatch.setattr(s5, "bind_log_context", lambda **k: None)
+    monkeypatch.setattr(s5, "build_trader_agent", lambda *a, **k: object())
+    monkeypatch.setattr(s5, "build_risk_agent", lambda *a, **k: object())
+    monkeypatch.setattr(s5, "Task", lambda **k: SimpleNamespace())
+    monkeypatch.setattr(s5, "Crew", lambda **k: SimpleNamespace(kickoff=lambda: None))
+    monkeypatch.setattr(
+        s5,
+        "_parse_task_output",
+        lambda task, model: fake_trader if model is TraderAssessment else fake_risk,
+    )
+    monkeypatch.setattr(
+        s5,
+        "analyze_multi_timeframe",
+        lambda *a, **k: {
+            "mtf_alignment": "ALIGNED",
+            "tf_biases": {"15min": "BULLISH", "1h": "BULLISH", "4h": "BULLISH"},
+        },
+    )
+    monkeypatch.setattr(s5.event_repo, "log_event", lambda *a, **k: 0)
+
+    res = s5._analyze_symbol_branch(sd, settings, "run-x")
+    # breakout_state normalizado al REAL (ABOVE), no al alucinado (BELOW)
+    assert res.trader.breakout_state == "ABOVE"
+    # score determinista: RSI neutral(20)+POC(25)+breakout(30)+MTF(25) = 100 (no 99)
+    assert res.trader.confluence_score == 100
+
+
+def test_authoritative_confluence_low_when_data_contradicts() -> None:
+    """A: datos que NO apoyan la dirección → score bajo, aunque el LLM dijera 100."""
+    settings = SimpleNamespace(effective_min_confluence=55)
+    # breakout BELOW mientras la dirección es LONG, POC bajo el mid, MTF no alineado
+    sd = _crew_data(state="BELOW", poc=7460.0)  # poc < mid
+    with patch("pipeline.stages.s5_analyze.analyze_multi_timeframe",
+               return_value={"mtf_alignment": "MIXED"}):
+        score = _authoritative_confluence(sd, "LONG", settings)
+    # RSI neutral(20)+POC contrario(10) = 30 → por debajo del umbral
+    assert score == 30
+    assert score < settings.effective_min_confluence
 
 
 def _result(
@@ -20,8 +149,11 @@ def _result(
     return SymbolResult(
         symbol=symbol,
         trader=TraderAssessment(
-            symbol=symbol, proposed_direction=direction, confluence_score=score,
-            confidence=score, reasons=["t"],
+            symbol=symbol,
+            proposed_direction=direction,
+            confluence_score=score,
+            confidence=score,
+            reasons=["t"],
         ),
         risk=RiskAssessment(symbol=symbol, risk_decision=risk_decision, reasons=["r"]),
     )
@@ -35,6 +167,14 @@ def test_trader_no_operar_maps_no_operar() -> None:
 def test_confluence_below_60_forces_no_operar() -> None:
     # Aunque el risk apruebe, score < 60 → NO_OPERAR.
     assert map_final_action("LONG", 59, "APPROVE_TRADE") == Action.NO_OPERAR
+
+
+def test_active_profile_accepts_55_with_medium_risk() -> None:
+    assert map_final_action("LONG", 55, "APPROVE_TRADE", min_confluence=55) == Action.LONG
+    result = _result(direction="LONG", score=55, risk_decision="APPROVE_TRADE")
+    output = consolidate([result], run_id="active", min_confluence=55, full_risk_confluence=70)
+    assert output.decisions[0].action == Action.LONG
+    assert output.decisions[0].risk == RiskMode.MEDIO
 
 
 def test_approve_trade_long() -> None:
@@ -95,13 +235,23 @@ def test_consolidate_preserves_full_trader_context() -> None:
     res = SymbolResult(
         symbol="US100",
         trader=TraderAssessment(
-            symbol="US100", proposed_direction="LONG", confluence_score=72,
-            confidence=72, rsi=48.0, vah=100.5, val=99.0, poc=99.8,
-            breakout_state="ABOVE", macro_risk="LOW", mtf_alignment="ALIGNED",
+            symbol="US100",
+            proposed_direction="LONG",
+            confluence_score=72,
+            confidence=72,
+            rsi=48.0,
+            vah=100.5,
+            val=99.0,
+            poc=99.8,
+            breakout_state="ABOVE",
+            macro_risk="LOW",
+            mtf_alignment="ALIGNED",
             reasons=["RSI neutral", "POC soporte"],
         ),
         risk=RiskAssessment(
-            symbol="US100", risk_decision="APPROVE_TRADE", rr_ratio=2.1,
+            symbol="US100",
+            risk_decision="APPROVE_TRADE",
+            rr_ratio=2.1,
             reasons=["R:R favorable"],
         ),
     )

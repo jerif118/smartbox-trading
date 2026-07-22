@@ -2,8 +2,16 @@
 Stage 7: Manage — Position Manager gestiona trades abiertos.
 
 Trabaja contra SQLite como source of truth. Reglas:
-- Si trade ha recorrido >= 1R a favor → mover SL a breakeven
-- Si trade ha recorrido >= 2R → trailing stop 1R detrás del high/low
+- La orden primary conserva su SL/TP original
+- Runner en >= 1R a favor → mover SL a breakeven
+- Runner en >= 2R → trailing stop 1R detrás del máximo favorable (high-water)
+
+El trailing y los gatillos (1R/2R) se basan en la MÁXIMA excursión favorable
+alcanzada por el trade (max_favorable_price), no en el precio del momento del
+run. Como el pipeline corre por ventanas, si el precio retrocede entre runs un
+trailing sobre el precio actual quedaría más flojo; anclarlo al high-water evita
+devolver ganancia ya conseguida y hace el SL monótono (solo sube en BUY / baja
+en SELL).
 """
 
 from __future__ import annotations
@@ -19,7 +27,7 @@ log = get_logger(__name__)
 def _compute_r_multiple(trade: OpenTradeContract, current_price: float) -> float | None:
     """Calcula R-multiple actual del trade."""
     entry = trade.entry_price
-    sl = trade.stop_loss
+    sl = trade.initial_stop_loss or trade.stop_loss
     if not entry or not sl or entry == sl:
         return None
     if trade.side == "BUY":
@@ -32,7 +40,7 @@ def stage_manage(
     run_id: str,
     broker: SimpleFXAdapter,
 ) -> ManageOutput:
-    """Gestiona trades abiertos. SL a BE en +1R, trailing en +2R."""
+    """Gestiona runners abiertos: SL a BE en +1R y trailing en +2R."""
     actions: list[ManageAction] = []
     for trade in input_data.open_trades:
         symbol = trade.symbol
@@ -40,45 +48,61 @@ def stage_manage(
         if current is None:
             continue
 
-        r = _compute_r_multiple(trade, current)
-        if r is None:
+        # R del precio actual (solo informativo) y R del máximo favorable (gatillo).
+        r_now = _compute_r_multiple(trade, current)
+        if r_now is None:
             continue
 
         entry = trade.entry_price
-        sl = trade.stop_loss
+        sl = trade.initial_stop_loss or trade.stop_loss
         side = trade.side
         is_runner = trade.is_runner
         trade_id = trade.id
 
+        # ── High-water: máxima excursión favorable alcanzada ──────────────
+        prev_mfe = trade.max_favorable_price
+        if side == "BUY":
+            mfe = current if prev_mfe is None else max(prev_mfe, current)
+        else:
+            mfe = current if prev_mfe is None else min(prev_mfe, current)
+        if mfe != prev_mfe:
+            trade_repo.update_max_favorable(trade_id, mfe)
+
+        # El gatillo 1R/2R y el trailing se anclan al mejor precio, no al actual.
+        r_peak = _compute_r_multiple(trade, mfe)
+        r_peak = r_now if r_peak is None else r_peak
+
         action = ManageAction(
             trade_id=trade_id,
             action="HOLD",
-            reason=f"R actual: {r:.2f}",
+            reason=f"R actual: {r_now:.2f} (pico: {r_peak:.2f})",
         )
 
-        # Regla: trailing / BE
+        # Regla: trailing / BE (sobre el high-water)
         new_sl = None
-        if r >= 2.0 and not is_runner:
-            # Trailing: SL a 1R detrás del high actual
+        if r_peak >= 2.0 and is_runner:
+            # Trailing: SL a 1R detrás del máximo favorable
             if side == "BUY":
-                new_sl = current - (entry - sl)
+                new_sl = mfe - (entry - sl)
             else:
-                new_sl = current + (sl - entry)
+                new_sl = mfe + (sl - entry)
             action.action = "MODIFY_SL"
             action.new_sl = round(new_sl, 2)
-            action.reason = f"R={r:.2f} >= 2.0, trailing SL a {new_sl:.2f}"
-        elif r >= 1.0 and not is_runner:
+            action.reason = f"R pico={r_peak:.2f} >= 2.0, trailing SL a {new_sl:.2f}"
+        elif r_peak >= 1.0 and is_runner:
             # BE: SL a entry
             new_sl = entry
             action.action = "MODIFY_SL"
             action.new_sl = round(new_sl, 2)
-            action.reason = f"R={r:.2f} >= 1.0, moved to breakeven"
+            action.reason = f"R pico={r_peak:.2f} >= 1.0, moved to breakeven"
 
         if action.action != "HOLD" and new_sl is not None:
             try:
                 # Solo modificar si el nuevo SL es MEJOR que el actual
                 current_sl = trade.stop_loss or 0
-                if (side == "BUY" and new_sl > current_sl) or (side == "SELL" and new_sl < current_sl):
+                if (side == "BUY" and new_sl > current_sl) or (
+                    side == "SELL" and new_sl < current_sl
+                ):
                     broker.modify_order(
                         trade.broker_order_id,
                         stop_loss=new_sl,

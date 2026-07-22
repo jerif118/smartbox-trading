@@ -67,6 +67,39 @@ def test_trades_lists_rows(capsys):
     assert "OPEN" in out
 
 
+def test_diagnose_empty_db_returns_1(capsys):
+    # Sin runs registrados: código 1 y mensaje claro.
+    assert cli.main(["diagnose"]) == 1
+    assert "Sin runs" in capsys.readouterr().out
+
+
+def test_diagnose_dumps_metrics_events_and_errors(capsys):
+    from infrastructure.persistence.sqlite import event_repo, stage_metrics_repo
+
+    run_repo.start_run("diag-1", {"symbols": ["US500"]})
+    stage_metrics_repo.insert_stage_metric("diag-1", "s1_ingest:US500", "ok", "2026-07-21T12:00:00+00:00", 900)
+    stage_metrics_repo.insert_stage_metric(
+        "diag-1", "s5_analyze", "timeout", "2026-07-21T12:01:00+00:00", 300000,
+        error_type="StageTimeoutError", error_msg="timeout tras 300s",
+    )
+    event_repo.log_event("diag-1", "orchestrator", "SYSTEM", {"event": "run_errors", "errors": ["boom"]})
+    run_repo.finish_run("diag-1", "partial", "boom")
+
+    # Acepta prefijo corto del run_id
+    assert cli.main(["diagnose", "diag-1"]) == 0
+    out = capsys.readouterr().out
+    assert "run diag-1" in out
+    assert "s1_ingest:US500" in out
+    assert "StageTimeoutError" in out
+    assert "run_errors" in out
+
+
+def test_diagnose_unknown_run_returns_1(capsys):
+    run_repo.start_run("diag-x")
+    assert cli.main(["diagnose", "nope-not-a-run"]) == 1
+    assert "no encontrado" in capsys.readouterr().err
+
+
 def test_doctor_runs(capsys):
     assert cli.main(["doctor"]) == 0
     out = capsys.readouterr().out

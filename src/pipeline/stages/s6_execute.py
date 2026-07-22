@@ -22,15 +22,17 @@ Orden de operaciones (anti-duplicados, anti-fantasmas):
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 
 from domain.errors import (
     CoherenceError,
     InsufficientRRError,
     InvalidBoxError,
 )
+from domain.signals.breakout import BreakoutState
 from domain.strategy.budget import DailyOrderBudget
 from domain.strategy.decision import Action
-from domain.strategy.order_spec import build_execution_plan, make_client_order_id
+from domain.strategy.order_spec import ExecutionPlan, build_execution_plan, make_client_order_id
 from domain.strategy.position_sizer import size_position
 from infrastructure.broker.simplefx.adapter import SimpleFXAdapter
 from infrastructure.config.settings import get_settings
@@ -48,6 +50,24 @@ from utils.logger import get_logger
 from utils.retry import retry
 
 log = get_logger(__name__)
+
+
+def _apply_risk_modifications(plan: ExecutionPlan, decision) -> ExecutionPlan:
+    """Aplica realmente los niveles propuestos cuando Risk devuelve MODIFY."""
+    if decision.signal.get("risk_decision") != "MODIFY":
+        return plan
+    stop = decision.key_levels.get("suggested_stop_loss")
+    take_profit = decision.key_levels.get("suggested_take_profit")
+    primary = replace(
+        plan.primary,
+        stop_loss=float(stop) if stop is not None else plan.primary.stop_loss,
+        take_profit=(float(take_profit) if take_profit is not None else plan.primary.take_profit),
+    )
+    runner = replace(
+        plan.runner,
+        stop_loss=float(stop) if stop is not None else plan.runner.stop_loss,
+    )
+    return replace(plan, primary=primary, runner=runner)
 
 
 @retry(max_retries=3, initial_delay=0.5, exceptions=(sqlite3.Error,))
@@ -80,7 +100,9 @@ def reconcile_pending_trades(run_id: str) -> list[str]:
             trade_repo.update_status(trade.id, "EXPIRED")
             log.info(
                 "Trade OPEN simulado %s (%s) del %s → EXPIRED",
-                trade.id, trade.broker_order_id, trade_day,
+                trade.id,
+                trade.broker_order_id,
+                trade_day,
             )
             event_repo.log_event(
                 run_id=run_id,
@@ -135,6 +157,25 @@ def stage_execute(
         # NO_OPERAR es un resultado normal de la estrategia, no un error
         return ExecuteOutput(decision_id=0, orders=[], errors=[])
 
+    if input_data.symbol != decision.symbol:
+        errors.append(f"symbol mismatch: input={input_data.symbol} decision={decision.symbol}")
+        return ExecuteOutput(decision_id=0, orders=[], errors=errors)
+
+    # La dirección del LLM nunca puede contradecir el breakout determinista.
+    breakout_raw = str(
+        decision.signal.get("breakout_state") or decision.signal.get("state") or ""
+    ).upper()
+    expected_action = {
+        BreakoutState.ABOVE.value: Action.LONG,
+        BreakoutState.BELOW.value: Action.SHORT,
+    }.get(breakout_raw)
+    if expected_action is None:
+        errors.append(f"breakout state missing/invalid: {breakout_raw or 'empty'}")
+        return ExecuteOutput(decision_id=0, orders=[], errors=errors)
+    if decision.action != expected_action:
+        errors.append(f"direction mismatch: breakout={breakout_raw} action={decision.action.value}")
+        return ExecuteOutput(decision_id=0, orders=[], errors=errors)
+
     # Regla #18
     if decision.confidence < settings.min_confidence:
         errors.append(f"confidence {decision.confidence} < min {settings.min_confidence}")
@@ -164,6 +205,7 @@ def stage_execute(
             sized=sized,
             action=decision.action,
         )
+        plan = _apply_risk_modifications(plan, decision)
         plan.validate(min_rr=input_data.min_rr)
     except (InsufficientRRError, CoherenceError, ValueError) as e:
         errors.append(f"plan invalid: {e}")
@@ -199,14 +241,19 @@ def stage_execute(
             skipped.append(coid)
             log.warning(
                 "Orden %s ya activa (trade %s, status %s) — no se reenvía",
-                coid, existing.id, existing.status,
+                coid,
+                existing.id,
+                existing.status,
             )
             event_repo.log_event(
                 run_id=run_id,
                 agent="decision_maker",
                 event_type="SYSTEM",
-                payload={"event": "ORDER_SKIPPED_DUPLICATE", "client_order_id": coid,
-                         "existing_trade_id": existing.id},
+                payload={
+                    "event": "ORDER_SKIPPED_DUPLICATE",
+                    "client_order_id": coid,
+                    "existing_trade_id": existing.id,
+                },
             )
             continue
 
@@ -266,11 +313,12 @@ def stage_execute(
             log.critical(
                 "Orden ENVIADA pero sin confirmar en DB: trade_id=%s "
                 "broker_order_id=%s coid=%s error=%s — reconciliar manualmente",
-                trade_id, broker_order_id, coid, e,
+                trade_id,
+                broker_order_id,
+                coid,
+                e,
             )
-            errors.append(
-                f"orden enviada sin confirmar: trade {trade_id} broker {broker_order_id}"
-            )
+            errors.append(f"orden enviada sin confirmar: trade {trade_id} broker {broker_order_id}")
             continue
 
         event_repo.log_event(

@@ -12,7 +12,6 @@ AGENT_ICONS = {
     "decision_maker": "👑",
     "trader": "📊",
     "risk_analyst": "🛡️",
-    "mtfa": "🔭",
     "position_manager": "🛠️",
     "system": "⚙️",
 }
@@ -61,7 +60,7 @@ def render() -> None:
     with col1:
         agents_filter = st.multiselect(
             "Filtrar por agente",
-            ["decision_maker", "trader", "risk_analyst", "mtfa", "position_manager"],
+            ["decision_maker", "trader", "risk_analyst", "position_manager"],
             default=[],
         )
     with col2:

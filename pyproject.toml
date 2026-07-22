@@ -27,9 +27,11 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
     "respx>=0.21",
     "freezegun>=1.4",
     "ruff>=0.5",
+    "mypy>=1.10",
 ]
 
 [project.scripts]
@@ -69,6 +71,22 @@ ignore = ["E501", "B008"]
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
+
+# ── Mypy ──────────────────────────────────────────────────────────────────
+# Arranque laxo: tipa las capas puras (domain, pipeline) sin bloquear el resto.
+# Se endurece por módulo con el tiempo (subir a strict cuando estén limpias).
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "src"
+files = ["src"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+# Solo estas capas se comprueban de momento; el resto se añade al limpiarlas.
+[[tool.mypy.overrides]]
+module = ["infrastructure.*", "application.*", "interfaces.*"]
+ignore_errors = true
 
 # ── Pytest ────────────────────────────────────────────────────────────────
 [tool.pytest.ini_options]

@@ -84,6 +84,8 @@ def test_fresh_db_gets_latest_version(temp_env):
         assert db.get_schema_version(conn) == db.LATEST_SCHEMA_VERSION
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(trades)").fetchall()}
         assert "client_order_id" in cols
+        assert "initial_stop_loss" in cols
+        assert "max_favorable_price" in cols
         tables = {
             r["name"]
             for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
@@ -100,9 +102,12 @@ def test_v0_db_migrates_preserving_data(temp_env):
         assert "client_order_id" in cols
         # datos previos intactos
         assert conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+        assert "max_favorable_price" in cols
         trade = conn.execute("SELECT * FROM trades").fetchone()
         assert trade["symbol"] == "US500"
         assert trade["client_order_id"] is None
+        assert trade["initial_stop_loss"] is None
+        assert trade["max_favorable_price"] is None
 
 
 def test_init_db_twice_is_idempotent(temp_env):
@@ -119,13 +124,29 @@ def test_partial_unique_index_blocks_active_duplicates(temp_env):
     run_repo.start_run("r1")
     coid = "2026-06-12:US500:BUY:P"
     trade_repo.insert_trade(
-        "r1", "US500", "BUY", 0.5, 5000.0, 4990.0, 5010.0,
-        is_runner=False, status="PENDING", client_order_id=coid,
+        "r1",
+        "US500",
+        "BUY",
+        0.5,
+        5000.0,
+        4990.0,
+        5010.0,
+        is_runner=False,
+        status="PENDING",
+        client_order_id=coid,
     )
     with pytest.raises(sqlite3.IntegrityError):
         trade_repo.insert_trade(
-            "r1", "US500", "BUY", 0.5, 5000.0, 4990.0, 5010.0,
-            is_runner=False, status="PENDING", client_order_id=coid,
+            "r1",
+            "US500",
+            "BUY",
+            0.5,
+            5000.0,
+            4990.0,
+            5010.0,
+            is_runner=False,
+            status="PENDING",
+            client_order_id=coid,
         )
 
 
@@ -134,14 +155,30 @@ def test_partial_unique_index_allows_retry_after_rejected(temp_env):
     run_repo.start_run("r1")
     coid = "2026-06-12:US500:BUY:P"
     tid = trade_repo.insert_trade(
-        "r1", "US500", "BUY", 0.5, 5000.0, 4990.0, 5010.0,
-        is_runner=False, status="PENDING", client_order_id=coid,
+        "r1",
+        "US500",
+        "BUY",
+        0.5,
+        5000.0,
+        4990.0,
+        5010.0,
+        is_runner=False,
+        status="PENDING",
+        client_order_id=coid,
     )
     trade_repo.update_status(tid, "REJECTED")
     # tras REJECTED el mismo coid puede reintentarse
     tid2 = trade_repo.insert_trade(
-        "r1", "US500", "BUY", 0.5, 5000.0, 4990.0, 5010.0,
-        is_runner=False, status="PENDING", client_order_id=coid,
+        "r1",
+        "US500",
+        "BUY",
+        0.5,
+        5000.0,
+        4990.0,
+        5010.0,
+        is_runner=False,
+        status="PENDING",
+        client_order_id=coid,
     )
     assert tid2 != tid
 
@@ -152,8 +189,16 @@ def test_find_active_by_client_order_id(temp_env):
     coid = "2026-06-12:US100:SELL:R"
     assert trade_repo.find_active_by_client_order_id(coid) is None
     tid = trade_repo.insert_trade(
-        "r1", "US100", "SELL", 0.5, 20000.0, 20050.0, 19950.0,
-        is_runner=True, status="PENDING", client_order_id=coid,
+        "r1",
+        "US100",
+        "SELL",
+        0.5,
+        20000.0,
+        20050.0,
+        19950.0,
+        is_runner=True,
+        status="PENDING",
+        client_order_id=coid,
     )
     found = trade_repo.find_active_by_client_order_id(coid)
     assert found is not None and found.id == tid
@@ -175,6 +220,7 @@ def test_count_orders_today_excludes_rejected(temp_env):
     )
     assert t1 != rejected
     assert trade_repo.count_orders_today() == 2
+    assert trade_repo.count_setups_today() == 1
 
 
 def test_fail_stale_runs(temp_env):
@@ -200,8 +246,13 @@ def test_stage_metrics_roundtrip(temp_env):
         "r1", "s1_ingest:US500", "ok", "2026-06-12T12:00:00+00:00", 1234
     )
     stage_metrics_repo.insert_stage_metric(
-        "r1", "s5_analyze", "timeout", "2026-06-12T12:01:00+00:00", 300000,
-        error_type="StageTimeoutError", error_msg="timeout tras 300s",
+        "r1",
+        "s5_analyze",
+        "timeout",
+        "2026-06-12T12:01:00+00:00",
+        300000,
+        error_type="StageTimeoutError",
+        error_msg="timeout tras 300s",
     )
     metrics = stage_metrics_repo.list_stage_metrics("r1")
     assert len(metrics) == 2

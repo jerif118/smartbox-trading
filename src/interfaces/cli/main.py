@@ -21,7 +21,9 @@ from infrastructure.llm.provider import LLMHealthChecker
 from infrastructure.persistence.sqlite import (
     db,
     equity_repo,
+    event_repo,
     run_repo,
+    stage_metrics_repo,
     trade_repo,
 )
 from utils.logger import get_logger
@@ -128,13 +130,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print("  • DB: ✗ no existe")
 
     print()
-    print("LLM Providers:")
+    print("LLM Providers (agentes activos):")
     for agent, model in [
-        ("decision_maker", settings.llm.decision_maker),
         ("trader", settings.llm.trader),
         ("risk_analyst", settings.llm.risk_analyst),
-        ("mtfa", settings.llm.mtfa),
-        ("position_manager", settings.llm.position_manager),
     ]:
         print(f"  • {agent:20s} {model}")
 
@@ -178,6 +177,65 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_diagnose(args: argparse.Namespace) -> int:
+    """Vuelca el diagnóstico completo de un run: métricas, eventos y errores.
+
+    Si no se pasa run_id, usa el run más reciente. Pensado para post-mortem de
+    corridas fallidas/parciales sin tener que abrir la DB a mano.
+    """
+    db.init_db()
+    run_id = args.run_id
+    if not run_id:
+        recent = run_repo.list_runs(limit=1)
+        if not recent:
+            print("Sin runs registrados.")
+            return 1
+        run_id = recent[0].id
+
+    run = run_repo.get_run(run_id)
+    if run is None:
+        # Permite pasar un prefijo corto (como muestra `status`).
+        match = next((r for r in run_repo.list_runs(limit=200) if r.id.startswith(run_id)), None)
+        if match is None:
+            print(f"Run {run_id} no encontrado.", file=sys.stderr)
+            return 1
+        run = match
+        run_id = run.id
+
+    print("=" * 60)
+    print(f"SmartBox v2 — Diagnose · run {run_id}")
+    print("=" * 60)
+    print(f"  status:   {run.status}")
+    print(f"  started:  {run.started_at}")
+    print(f"  finished: {run.finished_at or '(sigue running)'}")
+    if run.error:
+        print(f"  error:    {run.error}")
+
+    print()
+    print("Stage metrics:")
+    metrics = stage_metrics_repo.list_stage_metrics(run_id)
+    if not metrics:
+        print("  (sin métricas)")
+    for m in metrics:
+        mark = {"ok": "✓", "error": "✗", "timeout": "⏱"}.get(m["status"], "?")
+        line = f"  {mark} {m['stage']:<24} {m['status']:<8} {m['duration_ms']:>7}ms"
+        if m["error_type"]:
+            line += f"  {m['error_type']}: {m['error_msg']}"
+        print(line)
+
+    print()
+    print("Agent events:")
+    events = event_repo.list_events_by_run(run_id)
+    if not events:
+        print("  (sin eventos)")
+    for e in events:
+        payload = e.payload or ""
+        if len(payload) > 200:
+            payload = payload[:200] + "…"
+        print(f"  {e.ts} | {e.agent:<18} {e.event_type:<12} {payload}")
+    return 0
+
+
 def cmd_trades(args: argparse.Namespace) -> int:
     """Lista los últimos N trades."""
     db.init_db()
@@ -214,6 +272,13 @@ def main(argv: list[str] | None = None) -> int:
 
     p_status = sub.add_parser("status", help="Estado y stats")
     p_status.set_defaults(func=cmd_status)
+
+    p_diag = sub.add_parser("diagnose", help="Post-mortem de un run (métricas + eventos + errores)")
+    p_diag.add_argument(
+        "run_id", nargs="?", default=None,
+        help="ID del run (o prefijo). Vacío = run más reciente",
+    )
+    p_diag.set_defaults(func=cmd_diagnose)
 
     p_trades = sub.add_parser("trades", help="Lista trades")
     p_trades.add_argument("--limit", type=int, default=20, help="Cantidad máxima")
