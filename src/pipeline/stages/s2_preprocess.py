@@ -11,8 +11,14 @@ from pipeline.contracts import PreprocessInput, PreprocessOutput
 from domain.market_time import box_window_unix
 
 
-def stage_preprocess(input_data: PreprocessInput, df_candles) -> PreprocessOutput:
-    """Calcula features para un símbolo."""
+def stage_preprocess(input_data: PreprocessInput, df_candles, df_simple=None) -> PreprocessOutput:
+    """Calcula features para un símbolo.
+
+    `df_candles` son velas de Capital.com (referencia). `df_simple` (opcional)
+    son velas de SimpleFX para la caja del broker de ejecución; si es None o no
+    tiene velas en la ventana, la caja SimpleFX queda en None y la ejecución
+    usa la de Capital como fallback.
+    """
     box_from, box_to = box_window_unix(
         input_data.box_date,
         input_data.box_start,
@@ -20,10 +26,13 @@ def stage_preprocess(input_data: PreprocessInput, df_candles) -> PreprocessOutpu
         input_data.market_tz,
     )
 
-    # Box calculation
+    # Box Capital.com (referencia: ruptura + gate de amplitud)
     box = compute_box_from_df(df_candles, box_from, box_to)
     if box is None:
         raise ValueError(f"{input_data.symbol}: sin velas en ventana de caja")
+
+    # Box SimpleFX (broker de ejecución) — best-effort, nunca rompe el stage.
+    box_simple = compute_box_from_df(df_simple, box_from, box_to) if df_simple is not None else None
 
     # RSI
     rsi_val = last_rsi(df_candles["close"]) if "close" in df_candles.columns else None
@@ -61,6 +70,7 @@ def stage_preprocess(input_data: PreprocessInput, df_candles) -> PreprocessOutpu
     return PreprocessOutput(
         symbol=input_data.symbol,
         box=box,
+        box_simple=box_simple,
         rsi_last=rsi_val,
         volume_profile=vp,
         box_candles=box_candles,

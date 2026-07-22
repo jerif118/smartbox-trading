@@ -67,6 +67,48 @@ def test_preprocess_output_accepts_high_amplitude_for_skip_logic() -> None:
     assert not out.box.is_valid()
 
 
+def test_preprocess_computes_simplefx_box_from_df_simple() -> None:
+    """Con df_simple, la caja SimpleFX se calcula en su propio espacio de precios."""
+    from domain.market_time import box_window_unix
+
+    box_from, box_to = box_window_unix("2026-06-11", "08:00", "09:55", "America/New_York")
+    mid = (box_from + box_to) // 2
+    # Capital ~7500, SimpleFX ~19 pts abajo (offset como en las capturas del user).
+    cap = pd.DataFrame(
+        {"time": [box_from, mid, box_to], "open": [7500.0] * 3,
+         "high": [7513.0, 7514.0, 7512.0], "low": [7470.0, 7471.0, 7469.0],
+         "close": [7500.0] * 3, "volume": [1] * 3}
+    )
+    simple = pd.DataFrame(
+        {"time": [box_from, mid, box_to], "open": [7481.0] * 3,
+         "high": [7494.0, 7495.0, 7493.0], "low": [7451.0, 7452.0, 7450.0],
+         "close": [7481.0] * 3, "volume": [1] * 3}
+    )
+    inp = PreprocessInput(symbol="US500", start_iso="2026-06-11T08:00:00",
+                          end_iso="2026-06-11T12:00:00", box_date="2026-06-11")
+
+    out = stage_preprocess(inp, cap, simple)
+
+    assert out.box.high == 7514.0 and out.box.low == 7469.0  # Capital
+    assert out.box_simple is not None
+    assert out.box_simple.high == 7495.0 and out.box_simple.low == 7450.0  # SimpleFX
+
+
+def test_preprocess_box_simple_none_without_df_simple() -> None:
+    """Sin df_simple (feed caído) la caja SimpleFX queda en None."""
+    from domain.market_time import box_window_unix
+
+    box_from, box_to = box_window_unix("2026-06-11", "08:00", "09:55", "America/New_York")
+    cap = pd.DataFrame(
+        {"time": [box_from, box_to], "open": [100.0, 100.0], "high": [101.0, 101.5],
+         "low": [99.5, 99.0], "close": [100.5, 100.5], "volume": [1, 1]}
+    )
+    inp = PreprocessInput(symbol="US500", start_iso="2026-06-11T08:00:00",
+                          end_iso="2026-06-11T12:00:00", box_date="2026-06-11")
+    out = stage_preprocess(inp, cap, None)
+    assert out.box_simple is None
+
+
 def test_preprocess_output_rejects_malformed_box() -> None:
     """El contrato sigue rechazando cajas sin niveles coherentes."""
     from pydantic import ValidationError

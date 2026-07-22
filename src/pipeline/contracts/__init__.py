@@ -45,7 +45,10 @@ class PreprocessInput(BaseModel):
 
 class PreprocessOutput(BaseModel):
     symbol: str
-    box: Box
+    box: Box  # caja Capital.com — referencia (ruptura, gate de amplitud)
+    # Caja SimpleFX — broker de ejecución. None si el feed no devolvió velas;
+    # en ese caso la ejecución cae de vuelta a la caja Capital (BoxPair).
+    box_simple: Box | None = None
     rsi_last: float | None
     volume_profile: dict | None
     box_candles: list[dict]

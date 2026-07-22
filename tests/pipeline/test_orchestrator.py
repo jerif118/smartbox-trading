@@ -70,6 +70,8 @@ def _mock_stages(monkeypatch, analyze_side_effect=None):
     monkeypatch.setattr(orchestrator, "box_window_unix", lambda *a: (0, 1000))
     monkeypatch.setattr(orchestrator, "SimpleFXAdapter", MagicMock())
     monkeypatch.setattr(orchestrator, "CapitalAdapter", MagicMock())
+    # Sin red real al feed SimpleFX; la caja de ejecución la fija el mock de s2.
+    monkeypatch.setattr(orchestrator, "_fetch_simplefx_candles", lambda *a, **k: None)
     monkeypatch.setattr(
         orchestrator,
         "stage_ingest",
@@ -78,9 +80,10 @@ def _mock_stages(monkeypatch, analyze_side_effect=None):
     monkeypatch.setattr(
         orchestrator,
         "stage_preprocess",
-        lambda inp, df_c: PreprocessOutput(
+        lambda inp, df_c, df_s=None: PreprocessOutput(
             symbol=inp.symbol,
             box=box,
+            box_simple=box,
             rsi_last=55.0,
             volume_profile=None,
             box_candles=[],
@@ -253,9 +256,10 @@ def test_high_amplitude_symbol_skips_without_failed_run(monkeypatch):
     monkeypatch.setattr(
         orchestrator,
         "stage_preprocess",
-        lambda inp, df_c: PreprocessOutput(
+        lambda inp, df_c, df_s=None: PreprocessOutput(
             symbol=inp.symbol,
             box=wide_box,
+            box_simple=None,
             rsi_last=55.0,
             volume_profile=None,
             box_candles=[],
@@ -308,3 +312,30 @@ def test_primary_policy_detects_primary_breakout() -> None:
     active, confirmed = orchestrator.apply_primary_policy(signals, "US500", "size_reduction")
     assert confirmed is True
     assert all(item["primary_confirmed"] for item in active)
+
+
+def test_translate_suggested_levels_shifts_by_box_offset():
+    """MODIFY: los niveles sugeridos (Capital) se trasladan al espacio SimpleFX."""
+    from types import SimpleNamespace
+    cap = Box(high=7513.8, low=7468.1, amplitude_pct=0.61, n_candles=24)
+    sfx = Box(high=7549.6, low=7503.9, amplitude_pct=0.61, n_candles=24)  # ~+35.8
+    offset = round(sfx.mid - cap.mid, 2)
+    decision = SimpleNamespace(
+        action=Action.LONG,
+        key_levels={"suggested_stop_loss": 7468.1, "suggested_take_profit": 7559.5},
+    )
+    orchestrator._translate_suggested_levels(decision, cap, sfx)
+    assert decision.key_levels["suggested_stop_loss"] == round(7468.1 + offset, 1)
+    assert decision.key_levels["suggested_take_profit"] == round(7559.5 + offset, 1)
+
+
+def test_translate_suggested_levels_noop_when_same_box():
+    """Sin caja SimpleFX (fallback) offset=0 → no traslada."""
+    from types import SimpleNamespace
+    cap = Box(high=7513.8, low=7468.1, amplitude_pct=0.61, n_candles=24)
+    decision = SimpleNamespace(
+        action=Action.LONG,
+        key_levels={"suggested_stop_loss": 7468.1, "suggested_take_profit": None},
+    )
+    orchestrator._translate_suggested_levels(decision, cap, cap)
+    assert decision.key_levels["suggested_stop_loss"] == 7468.1

@@ -28,11 +28,12 @@ from datetime import UTC, datetime
 from typing import Any
 
 from domain.market_time import box_window_unix
-from domain.strategy.box import MAX_AMPLITUDE_PCT
+from domain.strategy.box import MAX_AMPLITUDE_PCT, BoxPair
 from domain.strategy.budget import DailyOrderBudget
 from domain.strategy.decision import Action, RiskMode
-from infrastructure.broker.capital.adapter import CapitalAdapter
+from infrastructure.broker.capital.adapter import CapitalAdapter, TIMEFRAME_SECONDS
 from infrastructure.broker.simplefx.adapter import SimpleFXAdapter
+from infrastructure.broker.simplefx.market_data import SimpleFXMarketData
 from infrastructure.config.settings import get_settings
 from infrastructure.persistence.sqlite import db, event_repo, run_repo, trade_repo
 from infrastructure.persistence.sqlite.equity_repo import insert_snapshot
@@ -62,6 +63,44 @@ log = get_logger(__name__)
 
 # Regla #6: el breakout se busca solo en las 2h posteriores al cierre de la caja
 BREAKOUT_WINDOW_SECONDS = 2 * 3600
+
+# Feed de velas SimpleFX para la caja del broker de ejecución (Regla #3).
+_simplefx_market = SimpleFXMarketData()
+
+
+def _fetch_simplefx_candles(symbol: str, timeframe: str, box_from: int, box_to: int):
+    """Velas SimpleFX de la ventana de caja. None (best-effort) si el feed falla.
+
+    Nunca propaga la excepción: un feed SimpleFX caído no debe tumbar el
+    pipeline; la caja de ejecución cae de vuelta a Capital (con aviso).
+    """
+    period_seconds = TIMEFRAME_SECONDS.get(timeframe, 300)
+    try:
+        df = _simplefx_market.get_candles(symbol, period_seconds, box_from, box_to)
+        return df if df is not None and not df.empty else None
+    except Exception as e:  # noqa: BLE001 — feed externo, degradación controlada
+        log.warning("[preprocess] %s: fallo feed velas SimpleFX: %s", symbol, e)
+        return None
+
+
+def _translate_suggested_levels(decision, capital_box, exec_box) -> None:
+    """Traslada los niveles sugeridos por el Risk (MODIFY) de Capital → SimpleFX.
+
+    El crew analiza y sugiere niveles en espacio Capital (gráfico de referencia),
+    pero la orden se manda en espacio SimpleFX. El offset es un desplazamiento
+    constante (no altera R:R ni coherencia): `nivel_simplefx = nivel_capital +
+    (exec_box.mid − capital_box.mid)`. Si exec_box ES la caja Capital (fallback
+    sin feed SimpleFX), el offset es 0 y no se traslada nada.
+
+    Muta `decision.key_levels` in situ (es la copia de esta ejecución).
+    """
+    offset = round(exec_box.mid - capital_box.mid, 2)
+    if offset == 0:
+        return
+    for key in ("suggested_stop_loss", "suggested_take_profit"):
+        val = decision.key_levels.get(key)
+        if val is not None:
+            decision.key_levels[key] = round(float(val) + offset, 1)
 
 
 def _is_weekend(date_str: str) -> bool:
@@ -251,6 +290,15 @@ def run_pipeline() -> RunResult:
                     errors.append(f"{sym}: ingest devolvió 0 velas")
                     return None
 
+                # Ventana de caja (unix) — se reutiliza para SimpleFX y el breakout.
+                box_from, box_to = box_window_unix(
+                    box_date, settings.box_start, settings.box_end, settings.market_tz
+                )
+
+                # Velas SimpleFX del broker de ejecución (best-effort): si el feed
+                # falla, df_simple=None y la caja SimpleFX cae de vuelta a Capital.
+                df_simple = _fetch_simplefx_candles(sym, settings.timeframe, box_from, box_to)
+
                 # Stage 2
                 pp_in = PreprocessInput(
                     symbol=sym,
@@ -267,8 +315,27 @@ def run_pipeline() -> RunResult:
                     stage_preprocess,
                     pp_in,
                     ingest_out.df_candles,
+                    df_simple,
                     timeout_s=settings.stage_timeout_s,
                 )
+
+                # Caja de ejecución: SimpleFX si es válida, si no Capital (Regla #3).
+                box_pair = BoxPair(capital=pp_out.box, simple=pp_out.box_simple)
+                exec_box = box_pair.primary
+                if pp_out.box_simple is None:
+                    log.warning(
+                        "[preprocess] %s: sin caja SimpleFX (feed vacío/caído) → "
+                        "ejecución usa caja Capital (niveles pueden estar corridos)",
+                        sym,
+                    )
+                else:
+                    log.info(
+                        "[preprocess] %s: box_simple=%.2f-%.2f amp=%.2f%% (broker de ejecución)",
+                        sym,
+                        pp_out.box_simple.low,
+                        pp_out.box_simple.high,
+                        pp_out.box_simple.amplitude_pct,
+                    )
                 log.info(
                     "[preprocess] %s: box=%.2f-%.2f amp=%.2f%% RSI=%s",
                     sym,
@@ -287,9 +354,7 @@ def run_pipeline() -> RunResult:
                     return None
 
                 # Stage 4 — regla #6: solo velas de las 2h posteriores a la caja
-                _, box_to = box_window_unix(
-                    box_date, settings.box_start, settings.box_end, settings.market_tz
-                )
+                # (la ruptura se detecta en la caja Capital = gráfico de referencia)
                 df = ingest_out.df_candles
                 post_box = df[
                     (df["time"] > box_to) & (df["time"] <= box_to + BREAKOUT_WINDOW_SECONDS)
@@ -332,7 +397,8 @@ def run_pipeline() -> RunResult:
                 return {
                     "symbol": sym,
                     "is_primary": sig_in.primary,
-                    "box": pp_out.box,
+                    "box": pp_out.box,  # Capital: referencia (VP, contexto)
+                    "exec_box": exec_box,  # SimpleFX (o fallback Capital): niveles de orden
                     "rsi_last": pp_out.rsi_last,
                     "volume_profile": pp_out.volume_profile,
                     "box_candles": pp_out.box_candles,
@@ -470,6 +536,9 @@ def run_pipeline() -> RunResult:
                         "close": sd["candle_close"],
                         "time": sd["signal_time"],
                     },
+                    # El crew analiza SIEMPRE la caja de Capital.com (gráfico de
+                    # referencia). La caja de SimpleFX NO se analiza: solo se usa
+                    # en Stage 6 para trasladar los niveles al precio del broker.
                     "caja": {
                         "high": sd["box"].high,
                         "low": sd["box"].low,
@@ -564,10 +633,14 @@ def run_pipeline() -> RunResult:
                     )
                     continue
 
+            # Niveles sugeridos por el Risk (MODIFY) → espacio SimpleFX antes de ejecutar.
+            if decision.action != Action.NO_OPERAR:
+                _translate_suggested_levels(decision, sym_data["box"], sym_data["exec_box"])
+
             exec_in = ExecuteInput(
                 decision=decision,
                 symbol=decision.symbol,
-                box=sym_data["box"],
+                box=sym_data["exec_box"],  # caja SimpleFX (broker de ejecución)
                 base_volume=settings.volume,
                 min_rr=settings.min_rr_ratio,
                 trade_date=trade_date,
