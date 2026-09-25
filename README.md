@@ -31,14 +31,52 @@ El bot corre una vez al día, antes de la apertura de la bolsa de Nueva York. Su
 2. Calcula la "caja" de precios: high/low/amplitud entre 08:00-09:55 NY
 3. Si la amplitud > 1%  → no opera
 4. Monitorea 2 horas post-caja esperando un breakout
-5. Cuando hay breakout vigente, Trader y Risk evalúan el setup:
-   - 📊 Trader — score direccional, RSI, VP y multi-timeframe
+5. FILTRA la ruptura por su penetración: si el cierre no se aleja al menos un
+   10% del rango de la caja, es ruido y se descarta sin gastar tokens
+6. Cuando hay breakout vigente y operable, Trader y Risk evalúan el setup:
+   - 📊 Trader — recibe métricas crudas y juzga si la rotura es legítima
    - 🛡️ Risk — veta solo reglas duras; incertidumbre moderada reduce tamaño
    - 👑 Desk Manager — consolidación determinista, sin otra llamada LLM
-6. Si se aprueba → envía 2 órdenes (primary + runner)
+7. Si se aprueba → envía 2 órdenes (primary + runner)
    - primary con TP fijo
    - runner con breakeven en +1R y trailing desde +2R
-7. Persiste todo en SQLite para que lo veas en el panel
+8. Persiste TODA decisión en SQLite —incluidas las de no operar— para poder
+   medir después si el filtro acierta
+```
+
+### Estado de la estrategia (medición honesta, 2026-09-24)
+
+Las cifras que antes aparecían aquí (67% de acierto, +0.575 R/trade) venían de
+un replay con **dos sesgos de futuro**, ya corregidos en `scripts/replay.py`:
+
+1. El sesgo de 4h usaba la vela de 08:00–12:00 NY, cuyo cierre ya contiene la
+   ruptura. Era lo único que hacía "funcionar" el score de confluencia.
+2. La entrada se simulaba como orden stop desde las 09:55. En vivo la orden se
+   envía *después* del cierre de ruptura, en el borde de la caja: es una orden
+   límite que solo se llena si el precio vuelve a la caja.
+
+Con el replay corregido (~380 días, feed SimpleFX, sin spread):
+
+| | US500 | US100 |
+|---|---|---|
+| trades llenados | 197 | 187 |
+| acierto primary | 49.7% | 51.9% |
+| R/trade solo primary | −0.005 | +0.037 |
+| R/trade primary + runner | −0.158 | −0.132 |
+| aprobados vs descartados por confluencia | −0.19 vs −0.14 | −0.08 vs −0.18 |
+
+Conclusión: **hoy la estrategia no tiene ventaja medible**; el runner resta, y
+el spread (≈0.5 pts US500, ≈2 pts US100) la vuelve negativa. Variantes probadas
+sin ventaja estadística (|t| < 1.7): entrada a mercado al cierre de ruptura,
+SL en la mitad de la caja, TP 2R y rango de apertura 09:30–09:45 / 09:30–10:00.
+**No operar en real** hasta que el replay muestre una ventaja estable en ambas
+mitades del histórico.
+
+**Cualquier umbral se recalibra con el replay, nunca a ojo:**
+
+```bash
+python scripts/replay.py --symbol US500 --days 200 --csv salida.csv
+python scripts/replay.py --symbol US500 --days 200 --min-penetration 20
 ```
 
 Todo queda registrado en SQLite. El panel te muestra:
@@ -269,7 +307,7 @@ Programa la tarea en **Programador de tareas** de Windows a las 7:50 AM.
 | `SIGNAL_MAX_AGE_MINUTES` | `15` | Descarta el primer breakout cuando ya quedó obsoleto |
 | `MACRO_BLACKOUT_MINUTES` | `15` | Veto antes/después de evento HIGH inmediato |
 | `MACRO_CAUTION_MINUTES` | `120` | Ventana de medio tamaño alrededor de eventos HIGH |
-| `MAX_CORRELATED_SETUPS` | `1` | Evita duplicar exposición US500/US100 en el mismo run |
+| `MAX_CORRELATED_SETUPS` | `1` | Símbolos con posición abierta a la vez (US500/US100). Ponlo en `2` para permitir ambos |
 | `DRY_RUN` | `true` | Si `true`, NO envía órdenes |
 | `SIMPLE_REALITY` | `DEMO` | `DEMO` o `LIVE` |
 | `DB_PATH` | `./data/smartbox.db` | Path de la base de datos |

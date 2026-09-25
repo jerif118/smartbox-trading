@@ -82,6 +82,7 @@ class Decision:
     crew_raw_output: str | None = None
     key_levels: str | None = None
     signal: str | None = None
+    execution_status: str | None = None
     created_at: str | None = None
 
     def to_dict(self) -> dict[str, Any]:

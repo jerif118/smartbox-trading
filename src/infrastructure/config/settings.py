@@ -152,12 +152,26 @@ class Settings(BaseSettings):
     active_min_confluence: int = Field(default=55, alias="ACTIVE_MIN_CONFLUENCE", ge=0, le=100)
     full_risk_confluence: int = Field(default=70, alias="FULL_RISK_CONFLUENCE", ge=0, le=100)
     signal_max_age_minutes: int = Field(default=15, alias="SIGNAL_MAX_AGE_MINUTES", ge=5, le=120)
+    # Penetración mínima de la ruptura, en % del rango de la caja, para que la
+    # señal se considere operable. Calibrado con scripts/replay.py sobre 235
+    # rupturas de US500+US100: por debajo de 10% el acierto cae a ~46%, por
+    # encima sube a 67%. Subirlo endurece el filtro (>=20% → 78.8% de acierto
+    # pero solo el 14% de las señales). Recalibrar con el replay, no a ojo.
+    min_breakout_penetration_pct: float = Field(
+        default=10.0, alias="MIN_BREAKOUT_PENETRATION_PCT", ge=0.0, le=100.0
+    )
     primary_confirmation_mode: Literal["required", "size_reduction", "independent"] = Field(
         default="size_reduction", alias="PRIMARY_CONFIRMATION_MODE"
     )
     macro_blackout_minutes: int = Field(default=15, alias="MACRO_BLACKOUT_MINUTES", ge=0, le=180)
     macro_caution_minutes: int = Field(default=120, alias="MACRO_CAUTION_MINUTES", ge=1, le=720)
     max_correlated_setups: int = Field(default=1, alias="MAX_CORRELATED_SETUPS", ge=1, le=2)
+    # Valor monetario de 1 punto del índice por 1 lote, para estimar el P&L al
+    # reconciliar cierres desde velas (SimpleFX no expone historial de órdenes).
+    # El R-múltiple que se guarda es exacto; ESTE número es el que convierte R
+    # en dinero, así que hay que calibrarlo contra el estado de cuenta real o
+    # MAX_DAILY_LOSS frenará antes o después de lo que debería.
+    point_value: float = Field(default=1.0, alias="POINT_VALUE", gt=0)
 
     # ── Seguridad ─────────────────────────────────────────────────────────
     dry_run: bool = Field(default=True, alias="DRY_RUN")
@@ -177,6 +191,10 @@ class Settings(BaseSettings):
     # ventana de breakout (2h posteriores al cierre de la caja 08:00–09:55).
     operate_start: str = Field(default="10:00", alias="OPERATE_START")
     operate_end: str = Field(default="12:00", alias="OPERATE_END")
+    # Hora (market_tz) a la que SimpleFX cancela una orden pendiente que no se
+    # llenó. Sin caducidad, una orden límite del día seguía viva en el broker
+    # y podía llenarse días después, sin que el bot la gestionara.
+    pending_expiry: str = Field(default="16:00", alias="PENDING_EXPIRY")
     # Cada cuánto vuelve a correr el pipeline dentro de la ventana (segundos).
     # El monitor se alinea al cierre de vela: corre en el próximo múltiplo de
     # este intervalo + monitor_grace_s (no cada N segundos desde el arranque).

@@ -104,6 +104,32 @@ def test_simplefx_modify_dry_run() -> None:
     adapter.modify_order("DRY-123", stop_loss=4995.0, take_profit=5015.0)
 
 
+def test_simplefx_current_price_uses_last_close() -> None:
+    """El PM gestiona trades de SimpleFX: el precio debe salir de SimpleFX."""
+    import pandas as pd
+
+    market = MagicMock()
+    market.get_candles.return_value = pd.DataFrame(
+        {"time": [1, 2, 3], "close": [7590.0, 7593.5, 7595.3]}
+    )
+    adapter = SimpleFXAdapter(market_data=market)
+    assert adapter.get_current_price("US500") == 7595.3
+    assert market.get_candles.call_args[0][0] == "US500"
+
+
+def test_simplefx_current_price_none_when_feed_fails() -> None:
+    """Feed caído o sin cierres → None (el PM salta el símbolo, no inventa)."""
+    import pandas as pd
+
+    broken = MagicMock()
+    broken.get_candles.side_effect = RuntimeError("feed caído")
+    assert SimpleFXAdapter(market_data=broken).get_current_price("US500") is None
+
+    empty = MagicMock()
+    empty.get_candles.return_value = pd.DataFrame()
+    assert SimpleFXAdapter(market_data=empty).get_current_price("US500") is None
+
+
 def _mock_resp(payload: dict, status_code: int = 200) -> MagicMock:
     resp = MagicMock()
     resp.json.return_value = payload
@@ -282,3 +308,38 @@ def test_capital_token_cache_compartido_entre_instancias() -> None:
 
         assert tokens1 == tokens2 == {"CST": "fake-cst", "X-SECURITY-TOKEN": "fake-xst"}
         assert mock_requests.post.call_count == 1  # un solo login compartido
+
+
+def test_simplefx_pending_expiry_today_and_none_when_past() -> None:
+    from datetime import datetime
+    from types import SimpleNamespace
+    from zoneinfo import ZoneInfo
+
+    from infrastructure.broker.simplefx.adapter import SimpleFXAdapter
+
+    ny = ZoneInfo("America/New_York")
+    settings = SimpleNamespace(market_tz="America/New_York", pending_expiry="16:00")
+    adapter = SimpleFXAdapter(settings=settings, market_data=object())
+
+    morning = datetime(2026, 9, 24, 10, 30, tzinfo=ny)
+    expected = int(datetime(2026, 9, 24, 16, 0, tzinfo=ny).timestamp() * 1000)
+    assert adapter._pending_expiry_ms(morning) == expected
+
+    evening = datetime(2026, 9, 24, 16, 5, tzinfo=ny)
+    assert adapter._pending_expiry_ms(evening) is None
+
+
+def test_capital_fetch_prices_404_is_empty_range_not_error() -> None:
+    """Un chunk que cae en fin de semana devuelve 404: es "sin precios", no un
+    fallo que deba tumbar toda la descarga multi-timeframe."""
+    from unittest.mock import MagicMock, patch
+
+    from infrastructure.broker.capital import adapter as cap
+
+    resp = MagicMock(status_code=404)
+    with patch.object(cap.requests, "get", return_value=resp) as get:
+        prices = cap._fetch_prices("US500", "MINUTE_15", "a", "b", "200", "cst", "xst")
+
+    assert prices == []
+    assert get.call_count == 1  # sin reintentos
+    resp.raise_for_status.assert_not_called()

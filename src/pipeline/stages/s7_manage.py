@@ -24,6 +24,15 @@ from utils.logger import get_logger
 log = get_logger(__name__)
 
 
+# SimpleFX responde 409 con code 1407 INVALID_ORDER cuando el id ya no
+# corresponde a ninguna orden viva. Es la única señal fiable de cierre que da
+# su API pública (no expone listado ni historial de órdenes).
+def _order_is_gone(exc: Exception) -> bool:
+    """True si el error del broker significa 'esa orden ya no existe'."""
+    text = str(exc).lower()
+    return "invalid_order" in text or ("409" in text and "conflict" in text)
+
+
 def _compute_r_multiple(trade: OpenTradeContract, current_price: float) -> float | None:
     """Calcula R-multiple actual del trade."""
     entry = trade.entry_price
@@ -123,9 +132,34 @@ def stage_manage(
                     action.action = "HOLD"
                     action.reason = f"new SL no mejora el actual ({new_sl} vs {current_sl})"
             except Exception as e:
-                log.error("PM: error modifying %s: %s", trade_id, e)
-                action.action = "HOLD"
-                action.reason = f"error: {e}"
+                if _order_is_gone(e):
+                    # El broker dice que esa orden ya no existe: se cerró (SL,
+                    # TP o manualmente) y la DB no se enteró. Sin esto el PM la
+                    # reintenta en cada corrida para siempre — el caso real del
+                    # 12-ago fueron 33 corridas con 409 INVALID_ORDER. Se marca
+                    # para que la reconciliación por velas le ponga precio y R.
+                    log.warning(
+                        "PM: la orden %s ya no existe en el broker (%s) → "
+                        "trade %s a reconciliar",
+                        trade.broker_order_id, e, trade_id,
+                    )
+                    trade_repo.update_status(trade_id, "CLOSED_MANUAL")
+                    event_repo.log_event(
+                        run_id=run_id,
+                        agent="position_manager",
+                        event_type="SYSTEM",
+                        payload={
+                            "event": "ORDER_GONE",
+                            "trade_id": trade_id,
+                            "broker_order_id": trade.broker_order_id,
+                        },
+                    )
+                    action.action = "HOLD"
+                    action.reason = "orden inexistente en el broker → cerrada en DB"
+                else:
+                    log.error("PM: error modifying %s: %s", trade_id, e)
+                    action.action = "HOLD"
+                    action.reason = f"error: {e}"
 
         actions.append(action)
 

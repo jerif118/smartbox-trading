@@ -68,8 +68,8 @@ def _mock_stages(monkeypatch, analyze_side_effect=None):
 
     monkeypatch.setattr(orchestrator, "_today_str", lambda tz=None: WEEKDAY)
     monkeypatch.setattr(orchestrator, "box_window_unix", lambda *a: (0, 1000))
+    # El PM pide precios al MISMO broker donde viven los trades (SimpleFX).
     monkeypatch.setattr(orchestrator, "SimpleFXAdapter", MagicMock())
-    monkeypatch.setattr(orchestrator, "CapitalAdapter", MagicMock())
     # Sin red real al feed SimpleFX; la caja de ejecución la fija el mock de s2.
     monkeypatch.setattr(orchestrator, "_fetch_simplefx_candles", lambda *a, **k: None)
     monkeypatch.setattr(
@@ -278,6 +278,111 @@ def test_high_amplitude_symbol_skips_without_failed_run(monkeypatch):
     assert run.status == "success"
 
 
+def test_amplitude_gate_uses_per_symbol_limit(monkeypatch):
+    """Una caja del 1.2% pasa el gate en US100 y lo bloquea en US500."""
+    import os
+
+    analyze_mock, exec_mock = _mock_stages(monkeypatch)
+    box_12 = Box(high=101.2, low=100.0, amplitude_pct=1.2, n_candles=10)
+    monkeypatch.setattr(
+        orchestrator,
+        "stage_preprocess",
+        lambda inp, df_c, df_s=None: PreprocessOutput(
+            symbol=inp.symbol,
+            box=box_12,
+            box_simple=box_12,
+            rsi_last=55.0,
+            volume_profile=None,
+            box_candles=[],
+        ),
+    )
+
+    os.environ["SYMBOLS"] = "US500"
+    reset_settings_cache()
+    try:
+        orchestrator.run_pipeline()
+        analyze_mock.assert_not_called()  # US500 sigue con el límite del 1%
+    finally:
+        os.environ.pop("SYMBOLS", None)
+        reset_settings_cache()
+
+    analyze_mock.reset_mock()
+    os.environ["SYMBOLS"] = "US100"
+    os.environ["PRIMARY_SYMBOL"] = "US100"
+    reset_settings_cache()
+    try:
+        orchestrator.run_pipeline()
+        analyze_mock.assert_called()  # US100 admite hasta 1.5%
+    finally:
+        os.environ.pop("SYMBOLS", None)
+        os.environ.pop("PRIMARY_SYMBOL", None)
+        reset_settings_cache()
+
+
+def test_simplefx_box_amplitude_does_not_affect_decisions(monkeypatch):
+    """La caja SimpleFX NO decide nada: el análisis corre solo con Capital.
+
+    Ambos feeds dan cajas del mismo tamaño (solo cambian los valores absolutos),
+    así que la amplitud de la de SimpleFX no puede vetar nada. Solo aporta los
+    niveles al enviar la orden.
+    """
+    analyze_mock, exec_mock = _mock_stages(monkeypatch)
+    capital_box = Box(high=100.5, low=100.0, amplitude_pct=0.5, n_candles=10)
+    wide_simple = Box(high=7560.0, low=7480.0, amplitude_pct=1.07, n_candles=10)
+
+    monkeypatch.setattr(
+        orchestrator,
+        "stage_preprocess",
+        lambda inp, df_c, df_s=None: PreprocessOutput(
+            symbol=inp.symbol,
+            box=capital_box,
+            box_simple=wide_simple,
+            rsi_last=55.0,
+            volume_profile=None,
+            box_candles=[],
+        ),
+    )
+
+    result = orchestrator.run_pipeline()
+
+    assert result.status == "success"
+    analyze_mock.assert_called()  # el análisis se hizo igual
+    exec_mock.assert_called()
+    # y la orden se arma con la caja de SimpleFX, no con la de Capital
+    assert exec_mock.call_args[0][0].box == wide_simple
+
+
+def test_missing_simplefx_box_blocks_order_without_capital_fallback(monkeypatch):
+    """Sin caja SimpleFX no se manda la orden — nunca con niveles de Capital.
+
+    Mandar los niveles de Capital al broker de SimpleFX pondría la entrada
+    dentro de la caja real y alejaría el SL, rompiendo el R:R.
+    """
+    analyze_mock, exec_mock = _mock_stages(monkeypatch)
+    capital_box = Box(high=100.5, low=100.0, amplitude_pct=0.5, n_candles=10)
+
+    monkeypatch.setattr(
+        orchestrator,
+        "stage_preprocess",
+        lambda inp, df_c, df_s=None: PreprocessOutput(
+            symbol=inp.symbol,
+            box=capital_box,
+            box_simple=None,  # feed de SimpleFX caído
+            rsi_last=55.0,
+            volume_profile=None,
+            box_candles=[],
+        ),
+    )
+
+    result = orchestrator.run_pipeline()
+
+    # El análisis (todo Capital) sí corre; lo que no ocurre es el envío.
+    analyze_mock.assert_called()
+    exec_mock.assert_not_called()
+    assert result.orders_sent == 0
+    assert any("sin caja SimpleFX" in e for e in result.errors)
+
+
 def test_symbol_error_without_signals_marks_failed(monkeypatch):
     _mock_stages(monkeypatch)
     monkeypatch.setattr(
@@ -312,30 +417,3 @@ def test_primary_policy_detects_primary_breakout() -> None:
     active, confirmed = orchestrator.apply_primary_policy(signals, "US500", "size_reduction")
     assert confirmed is True
     assert all(item["primary_confirmed"] for item in active)
-
-
-def test_translate_suggested_levels_shifts_by_box_offset():
-    """MODIFY: los niveles sugeridos (Capital) se trasladan al espacio SimpleFX."""
-    from types import SimpleNamespace
-    cap = Box(high=7513.8, low=7468.1, amplitude_pct=0.61, n_candles=24)
-    sfx = Box(high=7549.6, low=7503.9, amplitude_pct=0.61, n_candles=24)  # ~+35.8
-    offset = round(sfx.mid - cap.mid, 2)
-    decision = SimpleNamespace(
-        action=Action.LONG,
-        key_levels={"suggested_stop_loss": 7468.1, "suggested_take_profit": 7559.5},
-    )
-    orchestrator._translate_suggested_levels(decision, cap, sfx)
-    assert decision.key_levels["suggested_stop_loss"] == round(7468.1 + offset, 1)
-    assert decision.key_levels["suggested_take_profit"] == round(7559.5 + offset, 1)
-
-
-def test_translate_suggested_levels_noop_when_same_box():
-    """Sin caja SimpleFX (fallback) offset=0 → no traslada."""
-    from types import SimpleNamespace
-    cap = Box(high=7513.8, low=7468.1, amplitude_pct=0.61, n_candles=24)
-    decision = SimpleNamespace(
-        action=Action.LONG,
-        key_levels={"suggested_stop_loss": 7468.1, "suggested_take_profit": None},
-    )
-    orchestrator._translate_suggested_levels(decision, cap, cap)
-    assert decision.key_levels["suggested_stop_loss"] == 7468.1

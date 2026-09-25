@@ -175,6 +175,24 @@ def list_pending_trades() -> list[Trade]:
     return list_trades(status=TradeStatus.PENDING.value, limit=500)
 
 
+def list_trades_needing_outcome() -> list[Trade]:
+    """Trades cuyo resultado todavía no se conoce, para reconciliar por velas.
+
+    Incluye los OPEN (pueden haberse cerrado en el broker sin que la DB se
+    entere) y los que ya se marcaron cerrados pero sin P&L — el caso del
+    Position Manager cuando el broker responde INVALID_ORDER: sabe que la orden
+    murió, no a qué precio.
+    """
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM trades "
+            "WHERE (status = 'OPEN' OR (status IN ('CLOSED_TP','CLOSED_SL','CLOSED_MANUAL') "
+            "       AND pnl IS NULL)) "
+            "ORDER BY ts_open ASC LIMIT 500"
+        ).fetchall()
+    return [Trade(**{**dict(r), "is_runner": bool(r["is_runner"])}) for r in rows]
+
+
 def find_active_by_client_order_id(client_order_id: str) -> Trade | None:
     """Busca un trade activo (PENDING/OPEN) con ese client_order_id.
 
@@ -215,6 +233,21 @@ def count_setups_today() -> int:
             "SELECT COUNT(DISTINCT symbol) FROM trades "
             "WHERE DATE(ts_open) = ? AND status NOT IN ('REJECTED', 'EXPIRED')",
             (today,),
+        ).fetchone()
+    return int(row[0])
+
+
+def count_open_setups() -> int:
+    """Símbolos con exposición VIVA ahora mismo (trades PENDING/OPEN).
+
+    Es la base del límite de exposición correlacionada: mide cuántos símbolos
+    tienen posición a la vez, no cuántos se tocaron en el día. Sembrarlo con
+    `count_setups_today()` bloqueaba el segundo símbolo el resto de la jornada
+    aunque el trade del primero ya estuviera cerrado.
+    """
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT COUNT(DISTINCT symbol) FROM trades WHERE status IN ('PENDING', 'OPEN')"
         ).fetchone()
     return int(row[0])
 

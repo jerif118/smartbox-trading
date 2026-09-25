@@ -6,9 +6,10 @@ from __future__ import annotations
 
 from domain.indicators.rsi import last_rsi
 from domain.indicators.volume_profile import compute_volume_profile
+from domain.market_time import box_window_unix
+from domain.signals.divergence import detect_rsi_divergence
 from domain.strategy.box import compute_box_from_df
 from pipeline.contracts import PreprocessInput, PreprocessOutput
-from domain.market_time import box_window_unix
 
 
 def stage_preprocess(input_data: PreprocessInput, df_candles, df_simple=None) -> PreprocessOutput:
@@ -34,8 +35,11 @@ def stage_preprocess(input_data: PreprocessInput, df_candles, df_simple=None) ->
     # Box SimpleFX (broker de ejecución) — best-effort, nunca rompe el stage.
     box_simple = compute_box_from_df(df_simple, box_from, box_to) if df_simple is not None else None
 
-    # RSI
+    # RSI + divergencia precio/RSI (Regla #4). La divergencia es uno de los
+    # factores del score: entrar en la dirección de la rotura con el momento
+    # agotándose en contra es el escenario que más falsos breakouts produce.
     rsi_val = last_rsi(df_candles["close"]) if "close" in df_candles.columns else None
+    rsi_div = detect_rsi_divergence(df_candles) if "close" in df_candles.columns else None
 
     # Volume Profile (si hay columna volume)
     vp = None
@@ -72,6 +76,7 @@ def stage_preprocess(input_data: PreprocessInput, df_candles, df_simple=None) ->
         box=box,
         box_simple=box_simple,
         rsi_last=rsi_val,
+        rsi_divergence=rsi_div,
         volume_profile=vp,
         box_candles=box_candles,
     )

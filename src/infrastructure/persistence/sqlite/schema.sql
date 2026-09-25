@@ -36,6 +36,10 @@ CREATE TABLE IF NOT EXISTS decisions (
   crew_raw_output TEXT,                    -- JSON completo
   key_levels TEXT,                         -- JSON
   signal TEXT,                             -- JSON
+  -- EXECUTED | NO_OPERAR | REJECTED | SKIPPED_DUPLICATE. Toda decisión se
+  -- registra aunque no llegue al broker: sin las descartadas no se puede
+  -- medir si el filtro acierta.
+  execution_status TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (run_id) REFERENCES runs(id)
 );
@@ -43,6 +47,7 @@ CREATE TABLE IF NOT EXISTS decisions (
 CREATE INDEX IF NOT EXISTS idx_decisions_run_id ON decisions(run_id);
 CREATE INDEX IF NOT EXISTS idx_decisions_symbol ON decisions(symbol);
 CREATE INDEX IF NOT EXISTS idx_decisions_ts ON decisions(ts);
+CREATE INDEX IF NOT EXISTS idx_decisions_execution_status ON decisions(execution_status);
 
 -- ── Trades: una fila por orden enviada (primary + runner = 2 filas) ─
 CREATE TABLE IF NOT EXISTS trades (
@@ -136,3 +141,27 @@ CREATE TABLE IF NOT EXISTS equity_snapshots (
 );
 
 CREATE INDEX IF NOT EXISTS idx_equity_ts ON equity_snapshots(ts);
+
+-- ── Analyzed signals: una fila por RUPTURA ya analizada ───────────
+-- `detect_breakout` devuelve siempre el PRIMER cierre fuera de la caja, así
+-- que la misma ruptura se vuelve a detectar en cada vela hasta que caduca por
+-- edad. Esta tabla es la memoria de "esta ruptura ya tuvo su decisión": sin
+-- ella el símbolo ya decidido se re-analiza cada 5 min (tokens del crew) y el
+-- otro símbolo, que rompió después, nunca llega a operarse.
+CREATE TABLE IF NOT EXISTS analyzed_signals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  symbol TEXT NOT NULL,
+  signal_time TEXT NOT NULL,               -- ISO8601 de la vela que rompió la caja
+  breakout_state TEXT,                     -- ABOVE | BELOW
+  outcome TEXT,                            -- acción final para esa ruptura
+  run_id TEXT NOT NULL,
+  ts TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (run_id) REFERENCES runs(id)
+);
+
+-- Identidad de la señal: símbolo + vela que rompió.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_analyzed_signals_key
+  ON analyzed_signals(symbol, signal_time);
+
+CREATE INDEX IF NOT EXISTS idx_analyzed_signals_run_id ON analyzed_signals(run_id);

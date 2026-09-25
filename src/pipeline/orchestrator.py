@@ -9,8 +9,20 @@ Flujo:
 5. Context (macro)
 6. Analyze (crew, timeout largo)
 7. Por cada decisión: execute (idempotente)
-8. Equity snapshot (P&L computado)
-9. Marca run como success/partial/failed — nunca queda en "running"
+8. Marca cada ruptura como decidida (una ruptura, una decisión)
+9. Equity snapshot (P&L computado)
+10. Marca run como success/partial/failed — nunca queda en "running"
+
+Una ruptura, una decisión:
+- `detect_breakout` devuelve siempre el PRIMER cierre fuera de la caja, así que
+  la misma ruptura reaparece en cada vela hasta caducar por edad. Al cerrar el
+  run se apunta en `analyzed_signals` y el símbolo deja de entrar al crew: sin
+  eso el bot re-analizaba indefinidamente un símbolo ya operado y el segundo
+  símbolo, que rompe más tarde, no llegaba a operarse.
+- Solo se marca lo que llegó a un resultado de estrategia. Los fallos de
+  infraestructura (feed SimpleFX sin caja, stage de ejecución con error) se
+  reintentan en la vela siguiente; las órdenes ya enviadas las frena la
+  idempotencia por client_order_id.
 
 Robustez:
 - Cada stage corre vía pipeline.runner.run_stage: timeout configurable,
@@ -28,14 +40,20 @@ from datetime import UTC, datetime
 from typing import Any
 
 from domain.market_time import box_window_unix
-from domain.strategy.box import MAX_AMPLITUDE_PCT, BoxPair
+from domain.strategy.box import max_amplitude_for
 from domain.strategy.budget import DailyOrderBudget
 from domain.strategy.decision import Action, RiskMode
-from infrastructure.broker.capital.adapter import CapitalAdapter, TIMEFRAME_SECONDS
+from infrastructure.broker.capital.adapter import TIMEFRAME_SECONDS
 from infrastructure.broker.simplefx.adapter import SimpleFXAdapter
 from infrastructure.broker.simplefx.market_data import SimpleFXMarketData
 from infrastructure.config.settings import get_settings
-from infrastructure.persistence.sqlite import db, event_repo, run_repo, trade_repo
+from infrastructure.persistence.sqlite import (
+    db,
+    event_repo,
+    run_repo,
+    signal_repo,
+    trade_repo,
+)
 from infrastructure.persistence.sqlite.equity_repo import insert_snapshot
 from pipeline.contracts import (
     AnalyzeInput,
@@ -55,9 +73,13 @@ from pipeline.stages.s2_preprocess import stage_preprocess
 from pipeline.stages.s3_context import stage_context
 from pipeline.stages.s4_signal import stage_signal
 from pipeline.stages.s5_analyze import stage_analyze
-from pipeline.stages.s6_execute import reconcile_pending_trades, stage_execute
+from pipeline.stages.s6_execute import (
+    reconcile_closed_trades,
+    reconcile_pending_trades,
+    stage_execute,
+)
 from pipeline.stages.s7_manage import stage_manage
-from utils.logger import bind_log_context, get_logger, log_context, reset_log_context
+from utils.logger import bind_log_context, get_logger, reset_log_context
 
 log = get_logger(__name__)
 
@@ -83,26 +105,6 @@ def _fetch_simplefx_candles(symbol: str, timeframe: str, box_from: int, box_to: 
         return None
 
 
-def _translate_suggested_levels(decision, capital_box, exec_box) -> None:
-    """Traslada los niveles sugeridos por el Risk (MODIFY) de Capital → SimpleFX.
-
-    El crew analiza y sugiere niveles en espacio Capital (gráfico de referencia),
-    pero la orden se manda en espacio SimpleFX. El offset es un desplazamiento
-    constante (no altera R:R ni coherencia): `nivel_simplefx = nivel_capital +
-    (exec_box.mid − capital_box.mid)`. Si exec_box ES la caja Capital (fallback
-    sin feed SimpleFX), el offset es 0 y no se traslada nada.
-
-    Muta `decision.key_levels` in situ (es la copia de esta ejecución).
-    """
-    offset = round(exec_box.mid - capital_box.mid, 2)
-    if offset == 0:
-        return
-    for key in ("suggested_stop_loss", "suggested_take_profit"):
-        val = decision.key_levels.get(key)
-        if val is not None:
-            decision.key_levels[key] = round(float(val) + offset, 1)
-
-
 def _is_weekend(date_str: str) -> bool:
     from datetime import datetime as dt
 
@@ -120,14 +122,23 @@ def _today_str(tz: str = "America/New_York") -> str:
 
 
 def apply_primary_policy(
-    symbols_data: list[dict[str, Any]], primary_symbol: str, mode: str
+    symbols_data: list[dict[str, Any]],
+    primary_symbol: str,
+    mode: str,
+    primary_decided_today: bool = False,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Aplica la política de confirmación sin esconder señales secundarias.
 
     ``required`` bloquea; ``size_reduction`` conserva la señal y la marca para
     medio tamaño; ``independent`` solo registra el estado.
+
+    ``primary_decided_today`` cuenta como confirmación: el primario rompió su
+    caja hoy y su ruptura ya se resolvió, así que no vuelve a aparecer en
+    ``symbols_data``. Sin esta señal, un secundario que rompe más tarde se
+    trataría como "sin confirmación del primario" y entraría a medio tamaño (o
+    quedaría bloqueado en modo ``required``) por un breakout que sí existió.
     """
-    confirmed = any(
+    confirmed = primary_decided_today or any(
         item.get("symbol") == primary_symbol and item.get("is_primary") for item in symbols_data
     )
     enriched = [{**item, "primary_confirmed": confirmed} for item in symbols_data]
@@ -202,7 +213,16 @@ def run_pipeline() -> RunResult:
                 status="skipped",
             )
 
-        # ── Reconciliación de PENDING huérfanos ────────────────────────
+        # ── Reconciliación ─────────────────────────────────────────────
+        # Primero los cierres reales (un trade que el broker ya cerró no debe
+        # llegar al Position Manager), luego los PENDING huérfanos.
+        try:
+            n_closed = reconcile_closed_trades(run_id)
+            if n_closed:
+                log.info("Reconcile: %d trades cerrados desde el feed", n_closed)
+        except Exception as e:  # noqa: BLE001 — reconciliar no debe tumbar el run
+            log.error("Reconcile de cierres falló: %s", e)
+            errors.append(f"reconcile_closed_trades: {e}")
         pending_warnings = reconcile_pending_trades(run_id)
         errors.extend(pending_warnings)
 
@@ -210,7 +230,6 @@ def run_pipeline() -> RunResult:
         # Los agentes del crew se construyen por símbolo DENTRO de stage_analyze
         # (instancias aisladas por rama, nunca compartidas).
         broker = SimpleFXAdapter(settings)
-        market_data = CapitalAdapter(settings)
 
         # ── STAGE 7: Manage open positions (siempre primero) ───────────
         log.info("STAGE 7 · Position Manager (open trades)")
@@ -224,11 +243,16 @@ def run_pipeline() -> RunResult:
                 log.info("PM: sin trades abiertos")
                 return 0
             symbols_open = list({t["symbol"] for t in open_trades_dicts})
+            # El precio sale del broker donde VIVEN los trades (SimpleFX), no
+            # de Capital: los dos feeds cotizan el mismo índice con un offset
+            # de decenas de puntos y mezclarlos falsea el R-múltiple.
             current_prices: dict[str, float] = {}
             for sym in symbols_open:
-                price = market_data.get_current_price(sym)
-                if price is not None:
-                    current_prices[sym] = price
+                price = broker.get_current_price(sym)
+                if price is None:
+                    log.warning("PM: sin precio SimpleFX para %s — no se gestiona", sym)
+                    continue
+                current_prices[sym] = price
             manage_in = ManageInput(
                 open_trades=open_trades_dicts,
                 current_prices=current_prices,
@@ -319,22 +343,26 @@ def run_pipeline() -> RunResult:
                     timeout_s=settings.stage_timeout_s,
                 )
 
-                # Caja de ejecución: SimpleFX si es válida, si no Capital (Regla #3).
-                box_pair = BoxPair(capital=pp_out.box, simple=pp_out.box_simple)
-                exec_box = box_pair.primary
-                if pp_out.box_simple is None:
+                # Caja de ejecución (Regla #3): SIEMPRE la de SimpleFX, porque es
+                # el broker donde se manda la orden. NO entra en el análisis ni
+                # en las decisiones —todo eso corre sobre la caja Capital—; solo
+                # aporta los niveles en el momento de enviar la orden. Su
+                # amplitud tampoco decide nada: ambas cajas miden lo mismo y solo
+                # cambian los valores absolutos entre feeds.
+                exec_box = pp_out.box_simple
+                if exec_box is None:
                     log.warning(
                         "[preprocess] %s: sin caja SimpleFX (feed vacío/caído) → "
-                        "ejecución usa caja Capital (niveles pueden estar corridos)",
+                        "se analiza igual, pero no habrá niveles para enviar la orden",
                         sym,
                     )
                 else:
                     log.info(
                         "[preprocess] %s: box_simple=%.2f-%.2f amp=%.2f%% (broker de ejecución)",
                         sym,
-                        pp_out.box_simple.low,
-                        pp_out.box_simple.high,
-                        pp_out.box_simple.amplitude_pct,
+                        exec_box.low,
+                        exec_box.high,
+                        exec_box.amplitude_pct,
                     )
                 log.info(
                     "[preprocess] %s: box=%.2f-%.2f amp=%.2f%% RSI=%s",
@@ -344,12 +372,14 @@ def run_pipeline() -> RunResult:
                     pp_out.box.amplitude_pct,
                     pp_out.rsi_last,
                 )
-                if not pp_out.box.is_valid():
+                # Regla #1 con el límite del símbolo (US500 1%, US100 1.5%).
+                max_amp = max_amplitude_for(sym)
+                if not pp_out.box.is_valid(max_amp):
                     log.info(
                         "[preprocess] %s: amplitud %.2f%% > %.2f%% -> NO_OPERAR",
                         sym,
                         pp_out.box.amplitude_pct,
-                        MAX_AMPLITUDE_PCT,
+                        max_amp,
                     )
                     return None
 
@@ -386,6 +416,24 @@ def run_pipeline() -> RunResult:
                     )
                     return None
 
+                # Una ruptura, una decisión. `detect_breakout` devuelve siempre
+                # el PRIMER cierre fuera de la caja, así que la misma ruptura
+                # reaparece en cada vela hasta caducar por edad: sin este corte
+                # el símbolo ya decidido vuelve a pasar por el crew cada 5 min
+                # (tokens tirados) y deja sin turno al símbolo que rompió
+                # después. Si la marca existe, aquí termina el trabajo del
+                # símbolo: el trade vivo lo gestiona el Position Manager.
+                if signal_repo.is_analyzed(sym, sig_out.signal_time):
+                    log.info(
+                        "[signal] %s: ruptura %s de las %s YA decidida (%s) — "
+                        "no se re-analiza",
+                        sym,
+                        sig_out.breakout_state,
+                        sig_out.signal_time,
+                        signal_repo.get_outcome(sym, sig_out.signal_time) or "sin outcome",
+                    )
+                    return None
+
                 log.info(
                     "[signal] %s: BREAKOUT %s close=%.2f @ %s",
                     sym,
@@ -398,13 +446,15 @@ def run_pipeline() -> RunResult:
                     "symbol": sym,
                     "is_primary": sig_in.primary,
                     "box": pp_out.box,  # Capital: referencia (VP, contexto)
-                    "exec_box": exec_box,  # SimpleFX (o fallback Capital): niveles de orden
+                    "exec_box": exec_box,  # SimpleFX: niveles de orden. None → no se envía
                     "rsi_last": pp_out.rsi_last,
+                    "rsi_divergence": pp_out.rsi_divergence,
                     "volume_profile": pp_out.volume_profile,
                     "box_candles": pp_out.box_candles,
                     "breakout_state": sig_out.breakout_state,
                     "candle_close": sig_out.candle_close,
                     "signal_time": sig_out.signal_time,
+                    "penetration_pct": sig_out.penetration_pct,
                     "signal_age_minutes": sig_out.signal_age_minutes,
                 }
             except StageError as e:
@@ -448,6 +498,7 @@ def run_pipeline() -> RunResult:
             symbols_data,
             settings.primary_symbol_resolved,
             settings.primary_confirmation_mode,
+            primary_decided_today=signal_repo.analyzed_today(settings.primary_symbol_resolved),
         )
         if not symbols_data and settings.primary_confirmation_mode == "required":
             log.info(
@@ -535,10 +586,11 @@ def run_pipeline() -> RunResult:
                         "state": sd["breakout_state"],
                         "close": sd["candle_close"],
                         "time": sd["signal_time"],
+                        "penetration_pct": sd["penetration_pct"],
                     },
                     # El crew analiza SIEMPRE la caja de Capital.com (gráfico de
-                    # referencia). La caja de SimpleFX NO se analiza: solo se usa
-                    # en Stage 6 para trasladar los niveles al precio del broker.
+                    # referencia). La caja de SimpleFX NO entra aquí: solo aporta
+                    # los niveles en Stage 6, al enviar la orden. Sin traducciones.
                     "caja": {
                         "high": sd["box"].high,
                         "low": sd["box"].low,
@@ -546,7 +598,10 @@ def run_pipeline() -> RunResult:
                         "amp_pct": sd["box"].amplitude_pct,
                     },
                     "vp": sd["volume_profile"] or {},
-                    "rsi": {"last": sd["rsi_last"]},
+                    "rsi": {
+                        "last": sd["rsi_last"],
+                        "divergence": sd["rsi_divergence"],
+                    },
                     "macro": {
                         "risk": ctx_out.macro_risk,
                         "events": ctx_out.high_impact_events[:5],
@@ -578,12 +633,28 @@ def run_pipeline() -> RunResult:
                 -int(d.signal.get("confluence_score", d.confidence)),
             ),
         )
-        correlated_setups = trade_repo.count_setups_today()
+        # Exposición correlacionada = símbolos con posición VIVA (PENDING/OPEN),
+        # no símbolos tocados hoy. Contando el día entero, el primer símbolo que
+        # operaba dejaba al otro fuera hasta el cierre aunque su trade ya se
+        # hubiera cerrado; con MAX_CORRELATED_SETUPS=1 eso equivalía a "un solo
+        # símbolo por jornada". Sube a 2 si quieres US500 y US100 a la vez.
+        correlated_setups = trade_repo.count_open_setups()
+        # Resultado final por símbolo, para marcar la ruptura como decidida.
+        # Los símbolos que no aparezcan aquí NO se marcan: su ruptura se vuelve
+        # a intentar en la próxima vela (fallo de infraestructura, no decisión).
+        signal_outcomes: dict[str, str] = {}
         for decision in ordered_decisions:
             # encontrar el Box del símbolo
             sym_data = next((s for s in symbols_data if s["symbol"] == decision.symbol), None)
             if sym_data is None:
                 continue
+            if decision.symbol in analyze_out.failed_symbols:
+                # El crew no llegó a decidir (LLM/API caído): no es un
+                # NO_OPERAR de estrategia. Sin outcome la ruptura se reintenta
+                # en la próxima vela, y el fallo sale en los errores del run.
+                errors.append(f"{decision.symbol}: análisis falló — {'; '.join(decision.reasons)}"[:300])
+                continue
+            signal_outcomes[decision.symbol] = decision.action.value
             if decision.action != Action.NO_OPERAR:
                 if ctx_out.macro_risk == "HIGH":
                     log.info(
@@ -603,6 +674,7 @@ def run_pipeline() -> RunResult:
                             "provider_status": ctx_out.provider_status,
                         },
                     )
+                    signal_outcomes[decision.symbol] = "NO_OPERAR:macro_blackout"
                     continue
                 if ctx_out.macro_risk == "MEDIUM":
                     decision.risk = RiskMode.MEDIO
@@ -627,16 +699,45 @@ def run_pipeline() -> RunResult:
                             "symbol": decision.symbol,
                             "action": "NO_OPERAR",
                             "reason": "correlated_exposure_limit",
-                            "setups_today": correlated_setups,
+                            "open_setups": correlated_setups,
                             "max_correlated_setups": settings.max_correlated_setups,
                         },
                     )
+                    signal_outcomes[decision.symbol] = "NO_OPERAR:correlated_exposure_limit"
                     continue
 
-            # Niveles sugeridos por el Risk (MODIFY) → espacio SimpleFX antes de ejecutar.
-            if decision.action != Action.NO_OPERAR:
-                _translate_suggested_levels(decision, sym_data["box"], sym_data["exec_box"])
+            # Sin caja SimpleFX no hay niveles del broker de ejecución que
+            # mandar. No es una decisión de estrategia (esas ya se tomaron con
+            # Capital): es un fallo de ejecución. Antes se caía a los niveles de
+            # Capital, lo que ponía la entrada dentro de la caja real y alejaba
+            # el SL, rompiendo el R:R.
+            if sym_data["exec_box"] is None:
+                if decision.action == Action.NO_OPERAR:
+                    continue  # no había nada que enviar de todos modos
+                msg = (
+                    f"{decision.symbol}: sin caja SimpleFX — orden no enviada "
+                    "(los niveles deben salir del broker de ejecución)"
+                )
+                log.error("[execute] %s", msg)
+                errors.append(msg)
+                event_repo.log_event(
+                    run_id=run_id,
+                    agent="decision_maker",
+                    event_type="SYSTEM",
+                    payload={
+                        "event": "ORDER_NOT_SENT",
+                        "symbol": decision.symbol,
+                        "reason": "missing_simplefx_box",
+                    },
+                )
+                # Fallo del feed, no decisión: la ruptura NO se marca como
+                # decidida para volver a intentarla cuando SimpleFX responda.
+                signal_outcomes.pop(decision.symbol, None)
+                continue
 
+            # Los niveles (entry/SL/TP) salen deterministas de la caja SimpleFX
+            # dentro de execute. El Risk NO reescribe niveles: MODIFY solo baja el
+            # tamaño (RiskMode.MEDIO → vol/4). Sin traducciones ni offsets inferidos.
             exec_in = ExecuteInput(
                 decision=decision,
                 symbol=decision.symbol,
@@ -658,10 +759,17 @@ def run_pipeline() -> RunResult:
                     side_effecting=True,
                 )
             except StageError as e:
-                # una decisión fallida no aborta las siguientes
+                # una decisión fallida no aborta las siguientes; la ruptura
+                # queda sin marcar para reintentarla en la próxima vela (las
+                # órdenes ya enviadas las frena la idempotencia por coid).
                 errors.append(str(e))
+                signal_outcomes.pop(decision.symbol, None)
                 continue
             orders_sent += len(exec_out.orders)
+            if decision.action != Action.NO_OPERAR and not exec_out.orders:
+                # La decisión se resolvió (validación, R:R, duplicado, broker):
+                # queda cerrada igual, pero el outcome dice que no salió orden.
+                signal_outcomes[decision.symbol] = f"{decision.action.value}:sin_ordenes"
             if exec_out.orders:
                 correlated_setups += 1
             if exec_out.errors:
@@ -673,6 +781,36 @@ def run_pipeline() -> RunResult:
                     decision.symbol,
                     len(exec_out.skipped),
                 )
+
+        # ── Cierre de las señales analizadas ───────────────────────────
+        # Una ruptura, una decisión: marcarla impide que el próximo bar la
+        # vuelva a mandar al crew. Solo se marcan las que llegaron a un
+        # resultado de estrategia; las que se cayeron por infraestructura
+        # (feed SimpleFX sin caja, stage de ejecución con error) quedan sin
+        # marcar y se reintentan en la próxima vela.
+        for sd in symbols_data:
+            outcome = signal_outcomes.get(sd["symbol"])
+            if outcome is None:
+                log.warning(
+                    "[signal] %s: ruptura de las %s sin decisión firme — "
+                    "se reintentará en la próxima vela",
+                    sd["symbol"],
+                    sd["signal_time"],
+                )
+                continue
+            signal_repo.mark_analyzed(
+                run_id=run_id,
+                symbol=sd["symbol"],
+                signal_time=sd["signal_time"],
+                breakout_state=sd["breakout_state"],
+                outcome=outcome,
+            )
+            log.info(
+                "[signal] %s: ruptura de las %s cerrada como %s — no se re-analiza",
+                sd["symbol"],
+                sd["signal_time"],
+                outcome,
+            )
 
         # ── Equity snapshot (P&L computado desde trades; no hay endpoint
         #    de balance en el broker — source='computed') ────────────────

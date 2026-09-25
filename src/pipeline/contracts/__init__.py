@@ -46,10 +46,13 @@ class PreprocessInput(BaseModel):
 class PreprocessOutput(BaseModel):
     symbol: str
     box: Box  # caja Capital.com — referencia (ruptura, gate de amplitud)
-    # Caja SimpleFX — broker de ejecución. None si el feed no devolvió velas;
-    # en ese caso la ejecución cae de vuelta a la caja Capital (BoxPair).
+    # Caja SimpleFX — broker de ejecución. Aporta los niveles de la orden y
+    # nada más: no interviene en análisis ni decisiones. None si el feed no
+    # devolvió velas; en ese caso NO se envía orden (nunca con niveles Capital).
     box_simple: Box | None = None
     rsi_last: float | None
+    # "BEARISH" | "BULLISH" | None — divergencia precio/RSI (Regla #4).
+    rsi_divergence: str | None = None
     volume_profile: dict | None
     box_candles: list[dict]
 
@@ -92,6 +95,9 @@ class SignalInput(BaseModel):
     box: Box
     primary: bool = False
     max_age_minutes: int = Field(default=15, ge=1)
+    # Instante (unix, segundos) contra el que se mide la antigüedad de la señal.
+    # None → ahora. Sirve para tests deterministas; en producción va vacío.
+    now_ts: int | None = None
 
 
 class SignalOutput(BaseModel):
@@ -101,6 +107,10 @@ class SignalOutput(BaseModel):
     candle_close: float | None
     signal_time: str | None
     signal_age_minutes: float | None = None
+    # Cuánto penetró el cierre más allá del borde de la caja, en % del rango.
+    # Es el score de calidad de la ruptura; se informa incluso cuando la señal
+    # se descarta por marginal, para poder auditar el filtro después.
+    penetration_pct: float = 0.0
 
 
 # ── Stage 5: Analyze (crew) ───────────────────────────────────────────
@@ -108,6 +118,7 @@ class BreakoutSignalData(BaseModel):
     state: Literal["ABOVE", "BELOW", "INSIDE", "NONE"]
     close: float | None = None
     time: str | None = None
+    penetration_pct: float = 0.0
 
 
 class BoxLevelsData(BaseModel):
@@ -204,6 +215,9 @@ class DecisionContract(BaseModel):
 
 class AnalyzeOutput(BaseModel):
     decisions: list[DecisionContract] = Field(min_length=1)
+    # Símbolos cuya rama falló por infraestructura (LLM caído, error de API).
+    # Su NO_OPERAR no es una decisión: la ruptura se reintenta en la próxima vela.
+    failed_symbols: list[str] = Field(default_factory=list)
 
 
 # ── Stage 6: Execute ──────────────────────────────────────────────────

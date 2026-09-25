@@ -11,6 +11,7 @@ from domain.strategy.box import (
     Box,
     BoxPair,
     compute_box_from_df,
+    max_amplitude_for,
     select_valid_boxes,
 )
 
@@ -32,6 +33,35 @@ def test_box_invalid_over_1pct() -> None:
     assert not box.is_valid()
     with pytest.raises(InvalidBoxError):
         box.validate()
+
+
+def test_max_amplitude_is_per_symbol() -> None:
+    """US500 mantiene el 1%; US100 admite hasta 1.5%."""
+    assert max_amplitude_for("US500") == 1.0
+    assert max_amplitude_for("US100") == 1.5
+    assert max_amplitude_for("us100") == 1.5  # normaliza
+    # Un símbolo desconocido cae al límite más estricto, nunca al más laxo.
+    assert max_amplitude_for("DE40") == MAX_AMPLITUDE_PCT
+    assert max_amplitude_for("") == MAX_AMPLITUDE_PCT
+
+
+def test_box_amplitude_gate_respects_symbol_limit() -> None:
+    """Una caja del 1.2% es válida para US100 e inválida para US500."""
+    box = Box(high=101.2, low=100.0, amplitude_pct=1.2, n_candles=10)
+
+    assert box.is_valid(max_amplitude_for("US100")) is True
+    box.validate(max_amplitude_for("US100"))
+
+    assert box.is_valid(max_amplitude_for("US500")) is False
+    with pytest.raises(InvalidBoxError):
+        box.validate(max_amplitude_for("US500"))
+
+    # Sin argumento se aplica el default (el estricto): omitirlo no afloja nada.
+    assert box.is_valid() is False
+
+    # Y por encima de 1.5% tampoco opera US100.
+    too_wide = Box(high=101.6, low=100.0, amplitude_pct=1.6, n_candles=10)
+    assert too_wide.is_valid(max_amplitude_for("US100")) is False
 
 
 def test_box_high_less_than_low_raises() -> None:
@@ -67,6 +97,15 @@ def test_box_pair_falls_back_to_capital() -> None:
     bad = Box(high=100.5, low=99.0, amplitude_pct=5.0, n_candles=10)
     pair = BoxPair(capital=cap, simple=bad)
     assert pair.high == 100.0
+
+
+def test_box_with_non_positive_low_is_invalid() -> None:
+    """low <= 0 hace la amplitud incalculable: la caja no puede pasar el gate."""
+    df = pd.DataFrame({"time": [1, 2], "high": [1.0, 2.0], "low": [0.0, 0.5]})
+    box = Box.from_candles(df)
+    assert box.is_valid() is False
+    with pytest.raises(InvalidBoxError):
+        box.validate()
 
 
 def test_select_valid_boxes_filters() -> None:

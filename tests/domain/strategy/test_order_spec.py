@@ -105,3 +105,29 @@ def test_rr_ratio_computation() -> None:
     plan = build_long_plan("US500", _box(), _sized())
     # risk = 2, reward = 2, rr = 1.0
     assert plan.primary.rr_ratio == pytest.approx(1.0, abs=1e-6)
+
+
+def test_rr_is_exactly_one_regardless_of_box_rounding() -> None:
+    """El redondeo de niveles no puede tirar el R:R por debajo de min_rr.
+
+    El TP se derivaba de box.high/box.range SIN redondear mientras el riesgo
+    salía de entry/stop YA redondeados. Los dos se desalineaban hasta 0.1 y el
+    R:P caía a ~0.996, auto-vetando cajas válidas con "R:R=0.99 < min 1.0".
+    """
+    import random
+
+    random.seed(7)
+    sized = _sized()
+    for _ in range(2000):
+        high = round(random.uniform(7400.0, 7600.0), 3)
+        low = round(high - random.uniform(20.0, 70.0), 3)
+        box = Box(high=high, low=low, amplitude_pct=(high - low) / low * 100, n_candles=24)
+        for plan in (
+            build_long_plan("US500", box, sized),
+            build_short_plan("US500", box, sized),
+        ):
+            assert plan.primary.rr_ratio == pytest.approx(1.0, abs=1e-9), (
+                f"box {high}/{low} → entry={plan.primary.entry_price} "
+                f"SL={plan.primary.stop_loss} TP={plan.primary.take_profit}"
+            )
+            plan.validate(min_rr=1.0)  # no debe lanzar

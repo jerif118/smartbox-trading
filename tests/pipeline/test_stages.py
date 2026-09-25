@@ -187,7 +187,9 @@ def test_signal_above() -> None:
             "volume": [100, 100, 100, 100, 100],
         }
     )
-    out = stage_signal(SignalInput(symbol="US500", df_candles=df, box=box))
+    # now_ts ancla el reloj a la última vela: sin él, unas velas de 1970 son
+    # rancias por definición y el gate de antigüedad las rechazaría.
+    out = stage_signal(SignalInput(symbol="US500", df_candles=df, box=box, now_ts=500))
     assert out.has_breakout is True
     assert out.breakout_state == "ABOVE"
 
@@ -208,6 +210,89 @@ def test_signal_no_breakout() -> None:
     assert out.has_breakout is False
 
 
+def test_signal_rejects_marginal_penetration(monkeypatch) -> None:
+    """Con el filtro activo, un cierre que apenas asoma no es una ruptura.
+
+    Es el caso del 12-ago: cierre 0.20 puntos por debajo de una caja de 32.60
+    (0.6% del rango). El umbral se fija aquí a mano en vez de heredarlo del
+    entorno: en producción el filtro está desactivado (0), y lo que este test
+    cubre es el mecanismo, no la calibración desplegada.
+    """
+    from infrastructure.config.settings import reset_settings_cache
+
+    box = Box(high=7771.80, low=7739.20, amplitude_pct=0.42, n_candles=24)
+    df = pd.DataFrame({"time": [100, 200], "close": [7750.0, 7739.00]})
+
+    monkeypatch.setenv("MIN_BREAKOUT_PENETRATION_PCT", "10")
+    reset_settings_cache()
+    try:
+        out = stage_signal(
+            SignalInput(symbol="US500", df_candles=df, box=box, now_ts=200)
+        )
+    finally:
+        monkeypatch.undo()
+        reset_settings_cache()
+
+    assert out.has_breakout is False
+    assert out.penetration_pct == 0.61  # se informa para poder auditarlo
+    assert out.breakout_state is None
+
+
+def test_signal_accepts_marginal_penetration_with_filter_off(monkeypatch) -> None:
+    """Sin filtro (MIN_BREAKOUT_PENETRATION_PCT=0), toda ruptura es ruptura.
+
+    Es la configuración de producción: la caja se rompe o no se rompe, y no hay
+    un mínimo de penetración que descarte roturas reales por décimas.
+    """
+    from infrastructure.config.settings import reset_settings_cache
+
+    box = Box(high=7771.80, low=7739.20, amplitude_pct=0.42, n_candles=24)
+    df = pd.DataFrame({"time": [100, 200], "close": [7750.0, 7739.00]})
+
+    monkeypatch.setenv("MIN_BREAKOUT_PENETRATION_PCT", "0")
+    reset_settings_cache()
+    try:
+        out = stage_signal(
+            SignalInput(symbol="US500", df_candles=df, box=box, now_ts=200)
+        )
+    finally:
+        monkeypatch.undo()
+        reset_settings_cache()
+
+    assert out.has_breakout is True
+    assert out.breakout_state == "BELOW"
+    assert out.penetration_pct == 0.61
+
+
+def test_signal_accepts_decisive_penetration() -> None:
+    """El caso del 13-ago: cierre 4.70 puntos sobre una caja de 43.10 (10.9%)."""
+    box = Box(high=7800.40, low=7757.30, amplitude_pct=0.56, n_candles=24)
+    df = pd.DataFrame({"time": [100, 200], "close": [7780.0, 7805.10]})
+
+    out = stage_signal(SignalInput(symbol="US500", df_candles=df, box=box, now_ts=200))
+
+    assert out.has_breakout is True
+    assert out.breakout_state == "ABOVE"
+    assert out.penetration_pct == 10.9
+
+
+def test_signal_penetration_gate_is_configurable(monkeypatch) -> None:
+    """Subir MIN_BREAKOUT_PENETRATION_PCT endurece el filtro."""
+    from infrastructure.config.settings import reset_settings_cache
+
+    box = Box(high=7800.40, low=7757.30, amplitude_pct=0.56, n_candles=24)
+    df = pd.DataFrame({"time": [100, 200], "close": [7780.0, 7805.10]})  # 10.9%
+
+    monkeypatch.setenv("MIN_BREAKOUT_PENETRATION_PCT", "20")
+    reset_settings_cache()
+    try:
+        out = stage_signal(SignalInput(symbol="US500", df_candles=df, box=box, now_ts=200))
+        assert out.has_breakout is False
+    finally:
+        monkeypatch.undo()
+        reset_settings_cache()
+
+
 def test_signal_rejects_stale_first_breakout() -> None:
     box = Box(high=101.0, low=99.0, amplitude_pct=0.5, n_candles=10)
     df = pd.DataFrame(
@@ -216,9 +301,39 @@ def test_signal_rejects_stale_first_breakout() -> None:
             "close": [101.5, 100.5, 100.4],
         }
     )
-    out = stage_signal(SignalInput(symbol="US500", df_candles=df, box=box, max_age_minutes=15))
+    out = stage_signal(
+        SignalInput(
+            symbol="US500", df_candles=df, box=box, max_age_minutes=15, now_ts=1300
+        )
+    )
     assert out.has_breakout is False
     assert out.signal_age_minutes == 20.0
+
+
+def test_signal_age_is_measured_against_now_not_last_candle() -> None:
+    """La antigüedad se mide contra el reloj, no contra la última vela.
+
+    El orquestador recorta las velas a la ventana de breakout (2h); si la edad
+    se midiera contra la última vela de ese DataFrame nunca podría superar el
+    tamaño de la ventana y el gate max_age_minutes sería código muerto.
+    """
+    box = Box(high=101.0, low=99.0, amplitude_pct=0.5, n_candles=10)
+    # Breakout en la 1ª vela y última vela 2h después (ventana completa).
+    df = pd.DataFrame({"time": [0, 7200], "close": [101.5, 100.4]})
+
+    # Medido contra la última vela daría 120 min → pasaría el gate de 120.
+    fresh = stage_signal(
+        SignalInput(symbol="US500", df_candles=df, box=box, max_age_minutes=120, now_ts=7200)
+    )
+    assert fresh.has_breakout is True
+    assert fresh.signal_age_minutes == 120.0
+
+    # Cuatro horas más tarde la MISMA señal ya está rancia y se rechaza.
+    stale = stage_signal(
+        SignalInput(symbol="US500", df_candles=df, box=box, max_age_minutes=120, now_ts=21600)
+    )
+    assert stale.has_breakout is False
+    assert stale.signal_age_minutes == 360.0
 
 
 # ── Stage 3: Context ──────────────────────────────────────────────────
@@ -352,7 +467,9 @@ def test_execute_rejects_direction_against_breakout() -> None:
     broker.place_order.assert_not_called()
 
 
-def test_execute_applies_modify_levels() -> None:
+def test_execute_modify_keeps_box_levels_and_halves_size() -> None:
+    """MODIFY nunca reescribe niveles: entry/SL/TP salen deterministas de la caja
+    (mismo espacio → R:R=1.0). El ajuste de riesgo es solo de tamaño (vol/4)."""
     from domain.strategy.budget import DailyOrderBudget
     from infrastructure.persistence.sqlite import run_repo
 
@@ -364,6 +481,7 @@ def test_execute_applies_modify_levels() -> None:
         risk=RiskMode.MEDIO,
         confidence=70,
         reasons=["ajuste"],
+        # suggested_* (espacio Capital) NO deben influir en la orden.
         key_levels={"suggested_stop_loss": 100.1, "suggested_take_profit": 101.3},
         signal={"breakout_state": "ABOVE", "risk_decision": "MODIFY"},
         team_consensus="u",
@@ -377,8 +495,12 @@ def test_execute_applies_modify_levels() -> None:
         broker,
     )
     assert len(out.orders) == 2
-    assert all(order.stop_loss == 100.1 for order in out.orders)
-    assert out.orders[0].take_profit == 101.3
+    # Niveles LONG deterministas desde la caja: entry=high, SL=low, TP=high+range.
+    assert all(order.stop_loss == 100.0 for order in out.orders)
+    assert out.orders[0].entry_price == 100.5
+    assert out.orders[0].take_profit == 101.0
+    # MEDIO → vol/4 por orden (medio tamaño), no vol/2.
+    assert all(order.volume == 0.25 for order in out.orders)
 
 
 # ── Stage 7: Manage ───────────────────────────────────────────────────
@@ -420,6 +542,98 @@ def test_manage_moves_sl_to_breakeven() -> None:
     modified = trade_repo.get_trade(tid)
     assert modified.stop_loss == 100.0  # BE
     broker.modify_order.assert_called_once()
+
+
+def test_manage_marks_trade_closed_when_broker_says_order_is_gone() -> None:
+    """409 INVALID_ORDER = la orden ya no existe en el broker.
+
+    Antes solo se logueaba el error y el PM reintentaba el modify en cada
+    corrida (33 veces en el caso real del 12-ago) sobre una orden muerta,
+    mientras el trade seguía OPEN y el P&L del día quedaba en 0.
+    """
+    import requests
+
+    from infrastructure.persistence.sqlite import run_repo, trade_repo
+
+    run_repo.start_run("pm-gone")
+    tid = trade_repo.insert_trade(
+        run_id="pm-gone",
+        symbol="US500",
+        side="BUY",
+        volume=0.5,
+        entry_price=100.0,
+        stop_loss=98.0,
+        take_profit=None,
+        is_runner=True,
+    )
+    trade_repo.update_status(tid, "OPEN", broker_order_id="222676041")
+
+    inp = ManageInput(
+        open_trades=[
+            {
+                "id": tid,
+                "symbol": "US500",
+                "side": "BUY",
+                "entry_price": 100.0,
+                "stop_loss": 98.0,
+                "take_profit": None,
+                "is_runner": 1,
+                "broker_order_id": "222676041",
+            }
+        ],
+        current_prices={"US500": 102.0},  # +1R → intentaría mover a BE
+    )
+    broker = MagicMock()
+    broker.modify_order.side_effect = requests.HTTPError(
+        "409 Client Error: Conflict for url: ... {'code': 1407, 'message': 'INVALID_ORDER'}"
+    )
+
+    out = stage_manage(inp, "pm-gone", broker=broker)
+
+    assert trade_repo.get_trade(tid).status == "CLOSED_MANUAL"
+    assert all(a.action == "HOLD" for a in out.actions)
+
+
+def test_manage_keeps_trade_open_on_a_transient_broker_error() -> None:
+    """Un error de red NO significa que la orden haya muerto."""
+    import requests
+
+    from infrastructure.persistence.sqlite import run_repo, trade_repo
+
+    run_repo.start_run("pm-flaky")
+    tid = trade_repo.insert_trade(
+        run_id="pm-flaky",
+        symbol="US500",
+        side="BUY",
+        volume=0.5,
+        entry_price=100.0,
+        stop_loss=98.0,
+        take_profit=None,
+        is_runner=True,
+    )
+    trade_repo.update_status(tid, "OPEN", broker_order_id="555")
+
+    inp = ManageInput(
+        open_trades=[
+            {
+                "id": tid,
+                "symbol": "US500",
+                "side": "BUY",
+                "entry_price": 100.0,
+                "stop_loss": 98.0,
+                "take_profit": None,
+                "is_runner": 1,
+                "broker_order_id": "555",
+            }
+        ],
+        current_prices={"US500": 102.0},
+    )
+    broker = MagicMock()
+    broker.modify_order.side_effect = requests.ConnectionError("timeout")
+
+    stage_manage(inp, "pm-flaky", broker=broker)
+
+    assert trade_repo.get_trade(tid).status == "OPEN"
 
 
 def test_manage_hold_when_r_below_1() -> None:

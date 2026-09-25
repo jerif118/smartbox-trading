@@ -39,3 +39,11 @@ class DailyOrderBudget:
             self.used += n
             return True
         return False
+
+    def release(self, n: int = 1) -> None:
+        """Devuelve al budget cupos reservados que no se llegaron a enviar.
+
+        Sin esto, una orden que se reserva y luego se descarta (duplicado
+        detectado en carrera) quemaría cupo del día sin existir en el broker.
+        """
+        self.used = max(0, self.used - n)

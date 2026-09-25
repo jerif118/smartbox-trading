@@ -64,21 +64,24 @@ def build_risk_agent(symbol: str, llm_settings: LLMSettings, tools: list | None 
     return _build_agent(
         role=f"Risk_{symbol}",
         goal=(
-            f"Validar la propuesta del Trader_{symbol}. Calcular R:R numérico y peor "
-            f"escenario. Emitir un risk_decision EXACTO de este conjunto: "
+            f"Validar la propuesta del Trader_{symbol} y evaluar el peor escenario. "
+            f"Emitir un risk_decision EXACTO de este conjunto: "
             f"APPROVE_TRADE, APPROVE_NO_TRADE, MODIFY, NEED_DATA, VETO. "
             f"Reglas: si el trader propone NO_OPERAR → APPROVE_NO_TRADE. "
             f"Si faltan datos críticos → NEED_DATA. Si hay regla dura violada "
-            f"(macro_risk HIGH dentro del blackout, drawdown diario excedido, "
-            f"R:R < mínimo o dirección contraria al breakout) → VETO. "
+            f"(macro_risk HIGH dentro del blackout, drawdown diario excedido o "
+            f"dirección contraria al breakout) → VETO. "
             f"MTF mixto/contrario, calendario DEGRADED o falta de confirmación "
-            f"primaria se resuelven con MODIFY y medio tamaño, no con veto. "
+            f"primaria se resuelven con MODIFY (medio tamaño), no con veto. "
             f"Nunca uses 'APPROVE' a secas."
         ),
         backstory=(
             "Eres un gestor de riesgo práctico. Proteges contra pérdidas catastróficas, "
             "pero ante incertidumbre moderada reduces tamaño en vez de cancelar una "
-            "señal válida. Eres terminal: no delegas ni preguntas a coworkers."
+            "señal válida. Los niveles de entrada/stop/objetivo te llegan cerrados desde "
+            "la estrategia: no es tu trabajo reajustarlos ni recalcular su R:R, sino "
+            "decidir si se opera, se opera a medio tamaño o no se opera. "
+            "Eres terminal: no delegas ni preguntas a coworkers."
         ),
         llm=get_crewai_llm(llm_settings.risk_analyst, llm_settings),
         tools=tools,

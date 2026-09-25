@@ -129,7 +129,12 @@ def build_long_plan(
     """Regla #13: LONG: entry=box_high, SL=box_low, TP=box_high+amp."""
     entry = round(box.high, 1)
     stop = round(box.low, 1)
-    tp = round(box.high + box.range, 1)
+    # El TP se deriva de los niveles YA redondeados para que reward == risk de
+    # forma exacta. Calcularlo desde box.high/box.range sin redondear los
+    # desalineaba hasta 0.1: el riesgo salía de valores redondeados y la
+    # recompensa de valores crudos, tirando el R:R a 0.99 y auto-vetando
+    # cajas perfectamente válidas.
+    tp = round(entry + (entry - stop), 1)
     return ExecutionPlan(
         decision_action=decision_action,
         primary=OrderSpec(
@@ -164,7 +169,8 @@ def build_short_plan(
     """Regla #14: SHORT: entry=box_low, SL=box_high, TP=box_low-amp."""
     entry = round(box.low, 1)
     stop = round(box.high, 1)
-    tp = round(box.low - box.range, 1)
+    # Simétrico a build_long_plan: TP desde los niveles ya redondeados.
+    tp = round(entry - (stop - entry), 1)
     return ExecutionPlan(
         decision_action=decision_action,
         primary=OrderSpec(

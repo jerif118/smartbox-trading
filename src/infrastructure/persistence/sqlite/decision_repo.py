@@ -24,16 +24,24 @@ def insert_decision(
     crew_raw_output: dict | None = None,
     key_levels: dict | None = None,
     signal: dict | None = None,
+    execution_status: str = "EXECUTED",
 ) -> int:
-    """Inserta una decisión. Retorna el id."""
+    """Inserta una decisión. Retorna el id.
+
+    ``execution_status`` distingue lo que se operó de lo que se frenó
+    (NO_OPERAR, REJECTED, SKIPPED_DUPLICATE). Se registra TODO: las decisiones
+    descartadas son la mitad de la muestra necesaria para saber si el filtro
+    está bien calibrado.
+    """
     ts = _now()
     with get_db() as conn:
         cur = conn.execute(
             """
             INSERT INTO decisions (
                 run_id, ts, symbol, action, risk, confidence,
-                reasons, team_consensus, crew_raw_output, key_levels, signal
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                reasons, team_consensus, crew_raw_output, key_levels, signal,
+                execution_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id, ts, symbol, action, risk, confidence,
@@ -41,6 +49,7 @@ def insert_decision(
                 json.dumps(crew_raw_output) if crew_raw_output else None,
                 json.dumps(key_levels) if key_levels else None,
                 json.dumps(signal) if signal else None,
+                execution_status,
             ),
         )
     return int(cur.lastrowid)

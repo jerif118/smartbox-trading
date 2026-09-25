@@ -79,46 +79,81 @@ def test_agent_names_have_no_emoji_or_dashes(llm_settings: LLMSettings) -> None:
 # ── Tools / helpers: funcionalidad pura ──────────────────────────────
 # (El scoring de confluence y el MTF puro tienen tests en tests/domain/signals/;
 #  aquí se cubre el helper de descarga MTF y la DrawdownGuardTool.)
-def test_drawdown_guard_proceed() -> None:
-    tool = DrawdownGuardTool()
-    import json
-
-    result = json.loads(tool._run(max_daily_loss=500, current_daily_pnl=-100))
-    assert result["recommendation"] == "PROCEED"
-    assert result["exceeded"] is False
-
-
-def test_drawdown_guard_veto() -> None:
-    tool = DrawdownGuardTool()
-    import json
-
-    result = json.loads(tool._run(max_daily_loss=500, current_daily_pnl=-600))
-    assert result["recommendation"] == "VETO"
-    assert result["exceeded"] is True
-
-
-def test_drawdown_guard_lee_db_de_settings(tmp_path, monkeypatch) -> None:
-    """La tool usa settings.db_path (no una ruta relativa hardcodeada):
-    el PnL realizado hoy en esa DB cuenta para el drawdown."""
-    import json
+def _guard_db(tmp_path, monkeypatch, pnl: float | None) -> None:
+    """Prepara una DB con el P&L realizado de hoy y apunta settings a ella."""
     import sqlite3
     from datetime import UTC, datetime
 
     db_file = tmp_path / "guard.db"
     monkeypatch.setenv("DB_PATH", str(db_file))
+    monkeypatch.setenv("MAX_DAILY_LOSS", "500.0")
     reset_settings_cache()
 
     with sqlite3.connect(db_file) as conn:
         conn.execute("CREATE TABLE trades (id INTEGER PRIMARY KEY, ts_close TEXT, pnl REAL)")
-        conn.execute(
-            "INSERT INTO trades (ts_close, pnl) VALUES (?, ?)",
-            (datetime.now(UTC).isoformat(), -600.0),
-        )
+        if pnl is not None:
+            conn.execute(
+                "INSERT INTO trades (ts_close, pnl) VALUES (?, ?)",
+                (datetime.now(UTC).isoformat(), pnl),
+            )
 
-    tool = DrawdownGuardTool()
-    result = json.loads(tool._run(max_daily_loss=500, current_daily_pnl=0.0))
+
+def test_drawdown_guard_proceed(tmp_path, monkeypatch) -> None:
+    import json
+
+    _guard_db(tmp_path, monkeypatch, -100.0)
+    result = json.loads(DrawdownGuardTool()._run())
+    assert result["daily_pnl"] == -100.0
+    assert result["recommendation"] == "PROCEED"
+    assert result["exceeded"] is False
+
+
+def test_drawdown_guard_veto(tmp_path, monkeypatch) -> None:
+    import json
+
+    _guard_db(tmp_path, monkeypatch, -600.0)
+    result = json.loads(DrawdownGuardTool()._run())
     assert result["daily_pnl"] == -600.0
+    assert result["max_daily_loss"] == 500.0  # del sistema, no del LLM
     assert result["recommendation"] == "VETO"
+    assert result["exceeded"] is True
+
+
+def test_drawdown_guard_ignores_llm_supplied_arguments(tmp_path, monkeypatch) -> None:
+    """El LLM no puede elegir su propio límite ni inventarse el P&L.
+
+    Antes, `max_daily_loss=99999` o `current_daily_pnl=+5000` convertían un
+    VETO real en PROCEED: la barrera la desactivaba el propio modelo.
+    """
+    import json
+
+    _guard_db(tmp_path, monkeypatch, -600.0)
+    tool = DrawdownGuardTool()
+
+    for hostile in (
+        {"max_daily_loss": 99999.0},
+        {"current_daily_pnl": 5000.0},
+        {"max_daily_loss": 99999.0, "current_daily_pnl": 5000.0, "exceeded": False},
+    ):
+        result = json.loads(tool._run(**hostile))
+        assert result["recommendation"] == "VETO", hostile
+        assert result["daily_pnl"] == -600.0
+        assert result["max_daily_loss"] == 500.0
+
+
+def test_drawdown_guard_fails_closed_when_pnl_unavailable(monkeypatch) -> None:
+    """Sin dato fiable de P&L no se certifica seguridad: VETO, no PROCEED."""
+    import json
+
+    from infrastructure.persistence.sqlite import trade_repo
+
+    monkeypatch.setattr(
+        trade_repo, "realized_pnl_today", lambda: (_ for _ in ()).throw(RuntimeError("db caída"))
+    )
+    result = json.loads(DrawdownGuardTool()._run())
+    assert result["recommendation"] == "VETO"
+    assert result["exceeded"] is True
+    assert "db caída" in result["error"]
 
 
 def test_analyze_multi_timeframe_aligned() -> None:

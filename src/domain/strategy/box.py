@@ -16,7 +16,20 @@ import pandas as pd
 
 from domain.errors import InvalidBoxError
 
-MAX_AMPLITUDE_PCT = 1.0  # Regla #1
+MAX_AMPLITUDE_PCT = 1.0  # Regla #1 — límite por defecto
+
+# Regla #1 por símbolo. US100 es estructuralmente más volátil que US500, así que
+# una caja algo más ancha sigue siendo operable ahí. Un símbolo no listado cae
+# al límite por defecto (el más estricto).
+MAX_AMPLITUDE_PCT_BY_SYMBOL: dict[str, float] = {
+    "US500": 1.0,
+    "US100": 1.5,
+}
+
+
+def max_amplitude_for(symbol: str) -> float:
+    """Límite de amplitud (regla #1) aplicable a `symbol`."""
+    return MAX_AMPLITUDE_PCT_BY_SYMBOL.get((symbol or "").strip().upper(), MAX_AMPLITUDE_PCT)
 
 
 @dataclass(frozen=True)
@@ -43,11 +56,16 @@ class Box:
     def range(self) -> float:
         return self.high - self.low
 
-    def is_valid(self) -> bool:
-        """Regla #1: amplitud <= 1%."""
-        return self.amplitude_pct is not None and self.amplitude_pct <= MAX_AMPLITUDE_PCT
+    def is_valid(self, max_amplitude_pct: float = MAX_AMPLITUDE_PCT) -> bool:
+        """Regla #1: amplitud <= el límite del símbolo.
 
-    def validate(self) -> None:
+        El límite se pasa desde el llamador (`max_amplitude_for(symbol)`): la
+        Box no conoce su símbolo. Sin argumento aplica el default, el más
+        estricto, para que omitirlo nunca afloje la regla.
+        """
+        return self.amplitude_pct is not None and self.amplitude_pct <= max_amplitude_pct
+
+    def validate(self, max_amplitude_pct: float = MAX_AMPLITUDE_PCT) -> None:
         """Lanza InvalidBoxError si no cumple las reglas."""
         if self.high is None or self.low is None:
             raise InvalidBoxError(f"Box sin niveles (high={self.high}, low={self.low})")
@@ -57,9 +75,9 @@ class Box:
             )
         if self.amplitude_pct is None:
             raise InvalidBoxError("Box sin amplitud calculada")
-        if self.amplitude_pct > MAX_AMPLITUDE_PCT:
+        if self.amplitude_pct > max_amplitude_pct:
             raise InvalidBoxError(
-                f"Amplitud {self.amplitude_pct}% > {MAX_AMPLITUDE_PCT}% (regla #1)"
+                f"Amplitud {self.amplitude_pct}% > {max_amplitude_pct}% (regla #1)"
             )
         if self.n_candles <= 0:
             raise InvalidBoxError(f"Box con {self.n_candles} velas")
@@ -87,15 +105,18 @@ class Box:
             low_price = float(min(r[low_col] for r in rows))
             n = len(rows)
 
-        if low_price == 0:
-            amplitude = None
+        # Con low <= 0 la amplitud relativa no es calculable. Marcarla como
+        # infinita (y no como 0.0) evita que una caja degenerada pase el gate
+        # de la regla #1 aparentando ser la caja más estrecha posible.
+        if low_price <= 0:
+            amplitude = float("inf")
         else:
             amplitude = round((high_price - low_price) / low_price * 100, 2)
 
         return cls(
             high=high_price,
             low=low_price,
-            amplitude_pct=amplitude if amplitude is not None else 0.0,
+            amplitude_pct=amplitude,
             n_candles=n,
         )
 

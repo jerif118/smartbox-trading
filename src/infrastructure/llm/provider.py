@@ -133,4 +133,21 @@ def get_crewai_llm(model: str, settings: LLMSettings | None = None):
     litellm_model = build_litellm_model_string(model, s)
 
     log.info("LLM: model=%s provider=%s", litellm_model, provider)
-    return LLM(model=litellm_model, api_key=api_key, **extra)
+    llm = LLM(model=litellm_model, api_key=api_key, **extra)
+    if _needs_reasoning_off(provider, _name):
+        # Los modelos de razonamiento de OpenAI (gpt-5.x, o-series) rechazan
+        # tools en /v1/chat/completions salvo con reasoning_effort="none"
+        # (400 "Function tools with reasoning_effort are not supported").
+        # CrewAI solo envía reasoning_effort a modelos "o1", así que se inyecta
+        # por additional_params, que CrewAI copia en cada petición. Sin esto
+        # TODAS las llamadas de Trader/Risk fallaban y el día acababa NO_OPERAR.
+        llm.additional_params["reasoning_effort"] = "none"
+    return llm
+
+
+def _needs_reasoning_off(provider: str, name: str) -> bool:
+    """True para modelos de razonamiento de OpenAI (gpt-5*, o1/o3/o4…)."""
+    if provider != "openai":
+        return False
+    n = name.lower()
+    return n.startswith("gpt-5") or (len(n) > 1 and n[0] == "o" and n[1].isdigit())

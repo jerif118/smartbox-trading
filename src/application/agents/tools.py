@@ -12,10 +12,9 @@ se le inyectan al Trader; el LLM no las computa (no puede alterar el número fin
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
 
 from crewai.tools import BaseTool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from domain.signals.mtf import ema_bias, mtf_alignment
 
@@ -70,40 +69,53 @@ def analyze_multi_timeframe(
 
 # ── DrawdownGuardTool ─────────────────────────────────────────────────
 class DrawdownGuardInput(BaseModel):
-    max_daily_loss: float = Field(..., description="Max pérdida diaria permitida")
-    current_daily_pnl: float = Field(default=0.0, description="P&L del día actual")
+    """Sin parámetros a propósito.
+
+    Una barrera de riesgo cuyos umbrales los elige el propio modelo no es una
+    barrera. Antes el LLM pasaba `max_daily_loss` y `current_daily_pnl`, y
+    cualquiera de los dos daba la vuelta al veredicto: bastaba con declarar un
+    límite enorme o un P&L positivo para convertir un VETO en PROCEED. Ahora el
+    límite sale de settings y el P&L de la DB.
+    """
 
 
 class DrawdownGuardTool(BaseTool):
     name: str = "drawdown_guard"
     description: str = (
-        "Chequea si la pérdida diaria actual excede el máximo. Si excede, retorna VETO."
+        "Chequea si la pérdida realizada de hoy excede el máximo diario permitido. "
+        "NO recibe parámetros: el límite sale de la configuración del sistema y el "
+        "P&L de la base de datos. Retorna VETO si se excedió, PROCEED si no."
     )
 
     args_schema: type[BaseModel] = DrawdownGuardInput
 
-    def _run(self, max_daily_loss: float, current_daily_pnl: float = 0.0) -> str:
-        import sqlite3
-
+    def _run(self, **_kwargs: object) -> str:
+        """Ignora cualquier argumento que mande el LLM: los datos son del sistema."""
         from infrastructure.config.settings import get_settings
+        from infrastructure.persistence.sqlite import trade_repo
 
+        max_daily_loss = float(get_settings().max_daily_loss)
         try:
-            with sqlite3.connect(get_settings().db_path) as conn:
-                today = datetime.now(UTC).date().isoformat()
-                row = conn.execute(
-                    "SELECT COALESCE(SUM(pnl), 0) FROM trades "
-                    "WHERE DATE(ts_close) = ? AND pnl IS NOT NULL",
-                    (today,),
-                ).fetchone()
-        except Exception:
-            row = (0,)
+            # MISMA fuente que el freno duro de s6_execute, para que no puedan
+            # divergir: si uno dice VETO, el otro también.
+            realized = trade_repo.realized_pnl_today()
+        except Exception as e:  # noqa: BLE001 — sin dato fiable no se certifica nada
+            # Fail-closed: no poder leer el P&L no es prueba de que no haya pérdida.
+            return json.dumps(
+                {
+                    "daily_pnl": None,
+                    "max_daily_loss": max_daily_loss,
+                    "exceeded": True,
+                    "recommendation": "VETO",
+                    "error": f"P&L del día no disponible: {e}",
+                },
+                ensure_ascii=False,
+            )
 
-        realized = float(row[0] or 0)
-        total_daily = current_daily_pnl + realized
-        exceeded = abs(min(0.0, total_daily)) >= max_daily_loss
+        exceeded = realized <= -max_daily_loss
         return json.dumps(
             {
-                "daily_pnl": round(total_daily, 2),
+                "daily_pnl": round(realized, 2),
                 "max_daily_loss": max_daily_loss,
                 "exceeded": exceeded,
                 "recommendation": "VETO" if exceeded else "PROCEED",

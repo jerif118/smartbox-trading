@@ -37,6 +37,12 @@ from application.agents.tools import (
 )
 from domain.signals.confluence import compute_confluence_score
 from domain.signals.mtf import mtf_alignment
+from domain.signals.vp_path import (
+    clear_path_fraction,
+    dedupe_levels,
+    obstacles_between,
+    strong_levels,
+)
 from domain.strategy.decision import Action, RiskMode
 from domain.symbols import is_allowed
 from infrastructure.config.settings import get_settings
@@ -90,6 +96,7 @@ def stage_analyze(input_data: AnalyzeInput, run_id: str) -> AnalyzeOutput:
 
     # ── Ramas concurrentes: una por símbolo, agentes/crew aislados ─────
     results: list[SymbolResult] = []
+    failed: list[str] = []
     with ThreadPoolExecutor(max_workers=len(active)) as pool:
         futures = {pool.submit(_analyze_symbol_branch, sd, settings, run_id): sd for sd in active}
         for fut in as_completed(futures):
@@ -106,6 +113,7 @@ def stage_analyze(input_data: AnalyzeInput, run_id: str) -> AnalyzeOutput:
                 )
                 # Seguridad: una rama caída → NEED_DATA → NO_OPERAR.
                 results.append(_fallback_symbol_result(sd, f"rama falló: {e}"))
+                failed.append(sd.symbol)
 
     # ── Consolidación determinista (Desk_Manager, sin delegación) ──────
     output = consolidate(
@@ -114,6 +122,7 @@ def stage_analyze(input_data: AnalyzeInput, run_id: str) -> AnalyzeOutput:
         min_confluence=settings.effective_min_confluence,
         full_risk_confluence=settings.full_risk_confluence,
     )
+    output.failed_symbols = failed
 
     event_repo.log_event(
         run_id=run_id,
@@ -132,6 +141,18 @@ def _analyze_symbol_branch(sd: SymbolCrewData, settings: Any, run_id: str) -> Sy
     bind_log_context(run_id=run_id, symbol=symbol)
     log.info("[analyze:%s] iniciando rama Trader→Risk", symbol)
 
+    # La dirección candidata SOLO puede salir de un breakout real. Sin él no hay
+    # nada que analizar: antes caía a "LONG" por defecto, lo que arrancaba toda
+    # la rama (MTF + 2 llamadas al LLM) con una dirección inventada. Se corta
+    # aquí, antes de gastar red y tokens, con la regla de seguridad del módulo.
+    state = (sd.breakout_signal.state or "").upper()
+    candidate = {"ABOVE": "LONG", "BELOW": "SHORT"}.get(state)
+    if candidate is None:
+        log.error(
+            "[analyze:%s] breakout_state %r no operable → NO_OPERAR", symbol, state or "vacío"
+        )
+        return _fallback_symbol_result(sd, f"breakout_state no operable: {state or 'vacío'}")
+
     # El Trader NO usa tools: las señales técnicas (confluence, MTF) se calculan
     # deterministas y se le inyectan. El Risk sí usa drawdown_guard.
     risk_tools = [DrawdownGuardTool()]
@@ -143,24 +164,66 @@ def _analyze_symbol_branch(sd: SymbolCrewData, settings: Any, run_id: str) -> Sy
     strategy_levels_json = json.dumps(strategy_levels, ensure_ascii=False)
 
     # ── Señales técnicas deterministas (una sola descarga de MTF) ──────────
-    state = (sd.breakout_signal.state or "").upper()
-    candidate = "LONG" if state == "ABOVE" else "SHORT" if state == "BELOW" else "LONG"
     mtf = analyze_multi_timeframe(symbol, candidate)
     pre_conf = _confluence_from_sd(sd, candidate, settings, mtf)
+    # Se registra el score determinista ANTES de llamar al LLM: si luego el
+    # agente propone otra cosa, el log deja ver quién decidió qué.
+    log.info(
+        "[analyze:%s] calidad del setup: score=%s (%s)",
+        symbol,
+        pre_conf["score"],
+        "; ".join(pre_conf["factors"]),
+    )
 
+    # El prompt entrega MÉTRICAS CRUDAS, nunca el veredicto. Antes se le pasaba
+    # el confluence_score ya calculado junto a "si es < X propón NO_OPERAR", y
+    # el agente se limitaba a repetir la aritmética: no aportaba criterio, solo
+    # narraba una decisión ya tomada. El gate determinista sigue existiendo
+    # aparte (map_final_action); lo que se le pide aquí es el juicio que un
+    # gate no puede dar.
+    plan = strategy_levels["long" if candidate == "LONG" else "short"]
+    clear_path = _tp_clear_path(sd, candidate)
+    obstacles = obstacles_between(
+        plan["entry"],
+        plan["take_profit"],
+        dedupe_levels(strong_levels(sd.vp), float(sd.caja.high) - float(sd.caja.low)),
+    )
+    rsi_data = sd.rsi if isinstance(sd.rsi, dict) else {}
     trader_task = Task(
         description=(
-            f"Analiza SOLO el símbolo {symbol}. Datos de mercado (caja, breakout, "
-            f"RSI, volume profile VAH/VAL/POC, macro):\n{sd_json}\n\n"
-            f"Señales técnicas YA CALCULADAS (deterministas — úsalas como base):\n"
-            f"- confluence_score={pre_conf['score']} "
-            f"(factores: {pre_conf['factors']})\n"
-            f"- mtf_alignment={mtf.get('mtf_alignment')} "
-            f"(sesgos por timeframe: {mtf.get('tf_biases')})\n"
-            f"- breakout={state} → dirección implícita {candidate}\n\n"
-            f"Decide proposed_direction (LONG/SHORT/NO_OPERAR). Si el "
-            f"confluence_score < {settings.effective_min_confluence} o el contexto "
-            f"macro lo desaconseja, propon NO_OPERAR.\n"
+            f"Analiza SOLO el símbolo {symbol}. Eres un trader de rupturas de "
+            f"caja: la caja ya se rompió y la dirección ya está decidida. Tu "
+            f"trabajo NO es juzgar si la rotura fue fuerte o débil — eso no "
+            f"predice nada y no debe entrar en tu razonamiento. Tu trabajo es "
+            f"juzgar el CONTEXTO en el que se va a operar esa rotura.\n\n"
+            f"Datos de mercado (caja, breakout, RSI, volume profile VAH/VAL/POC, "
+            f"macro):\n{sd_json}\n\n"
+            f"Contexto del setup:\n"
+            f"- dirección implícita del breakout: {candidate} (estado {state})\n"
+            f"- tendencia de 4h (marco mayor): {mtf.get('htf_bias')}\n"
+            f"- sesgos multi-timeframe: {mtf.get('tf_biases')} "
+            f"(alineación {mtf.get('mtf_alignment')})\n"
+            f"- divergencia precio/RSI: {rsi_data.get('divergence') or 'ninguna'} "
+            f"(RSI actual {rsi_data.get('last')})\n"
+            f"- entrada {plan['entry']} → TP {plan['take_profit']}; niveles "
+            f"fuertes de volumen en el camino: {obstacles or 'ninguno'} "
+            f"(camino despejado: "
+            f"{'sin datos' if clear_path is None else f'{clear_path * 100:.0f}%'})\n\n"
+            f"Lo que SÍ debe mover tu decisión, en este orden:\n"
+            f"1. Operar contra la tendencia de 4h es el motivo más común de "
+            f"fallo. A favor del marco mayor, la rotura tiene continuidad.\n"
+            f"2. Un nivel de alto volumen entre la entrada y el TP es una zona "
+            f"donde el precio se acepta y se frena: si el TP queda al otro "
+            f"lado, probablemente no se toque y el trade muera en breakeven.\n"
+            f"3. Una divergencia precio/RSI en contra de {candidate} indica "
+            f"que el momento se está agotando justo al entrar.\n"
+            f"4. Contexto macro y estructura del día.\n\n"
+            f"Lo que NO debe moverla: cuánto penetró el cierre fuera de la "
+            f"caja. Una ruptura es una ruptura; su magnitud no discrimina y "
+            f"citarla como razón es ruido.\n\n"
+            f"Decide proposed_direction: {candidate} si el contexto acompaña, "
+            f"NO_OPERAR si ves motivos concretos para dudar. Explica en reasons "
+            f"QUÉ observas, no qué umbral se cumplió.\n"
             f"Devuelve JSON con: symbol, proposed_direction, confidence (0-100), "
             f"reasons (lista de razones de tu decisión)."
         ),
@@ -174,27 +237,28 @@ def _analyze_symbol_branch(sd: SymbolCrewData, settings: Any, run_id: str) -> Sy
             f"Valida la propuesta del Trader para {symbol}. Tienes el resultado "
             f"COMPLETO del trader en el contexto (dirección, confluence_score, RSI, "
             f"VAH/VAL/POC, breakout, macro, mtf).\n\n"
-            f"Niveles explícitos de la estrategia calculados desde la caja:\n"
+            f"Niveles CERRADOS de la estrategia, calculados desde la caja:\n"
             f"{strategy_levels_json}\n"
-            f"Para LONG usa long.entry, long.stop_loss y long.take_profit. "
-            f"Para SHORT usa short.entry, short.stop_loss y short.take_profit. "
-            f"No marques falta de stop_loss/take_profit: ya están en strategy_levels.\n\n"
-            f"Calcula R:R con "
-            f"min_rr={settings.min_rr_ratio} y usa drawdown_guard con "
-            f"max_daily_loss={settings.max_daily_loss}.\n\n"
+            f"Para LONG usa long.*; para SHORT usa short.*. Estos niveles NO son "
+            f"negociables: salen deterministas de la caja y ya incluyen su rr_ratio "
+            f"calculado. No los recalcules, no propongas otros y no marques falta de "
+            f"stop_loss/take_profit. Tu trabajo es aprobar o frenar, no reajustar.\n\n"
+            f"Llama a drawdown_guard SIN argumentos (lee el límite y el P&L del "
+            f"sistema por su cuenta) y respeta su recommendation.\n\n"
             f"Emite risk_decision EXACTO de: APPROVE_TRADE, APPROVE_NO_TRADE, "
             f"MODIFY, NEED_DATA, VETO. Reglas:\n"
             f"- trader propone NO_OPERAR → APPROVE_NO_TRADE\n"
             f"- faltan datos críticos → NEED_DATA\n"
-            f"- macro_risk HIGH dentro del blackout / drawdown excedido / "
-            f"R:R < min / dirección contra breakout → VETO\n"
+            f"- macro_risk HIGH dentro del blackout / drawdown_guard devuelve VETO / "
+            f"dirección contra breakout → VETO\n"
             f"- macro MEDIUM, provider DEGRADED, MTF contrario o primary_confirmed=false "
-            f"→ MODIFY (medio tamaño), no VETO\n"
-            f"- trader propone LONG/SHORT y todo OK → APPROVE_TRADE\n"
-            f"- operar pero con ajuste de niveles → MODIFY (incluye suggested_stop_loss/"
-            f"suggested_take_profit).\n"
-            f"Devuelve JSON con: symbol, risk_decision, rr_ratio, reasons (lista), "
-            f"suggested_stop_loss, suggested_take_profit."
+            f"→ MODIFY, no VETO\n"
+            f"- trader propone LONG/SHORT y todo OK → APPROVE_TRADE\n\n"
+            f"IMPORTANTE — qué significa MODIFY: opera igual, con los MISMOS niveles, "
+            f"pero a medio tamaño. NO mueve el stop ni el take profit. Si lo que "
+            f"quieres es no operar, usa VETO; MODIFY nunca cancela una entrada.\n\n"
+            f"Devuelve JSON con: symbol, risk_decision, rr_ratio (copia el de "
+            f"strategy_levels), reasons (lista)."
         ),
         agent=risk,
         expected_output="JSON RiskAssessment para el símbolo",
@@ -240,7 +304,7 @@ def _analyze_symbol_branch(sd: SymbolCrewData, settings: Any, run_id: str) -> Sy
             else mtf.get("mtf_alignment")
         )
         trader_res.confluence_score = _authoritative_confluence(
-            sd, trader_res.proposed_direction, settings, mtf=mtf
+            sd, trader_res.proposed_direction, settings, mtf
         )
     else:
         trader_res.mtf_alignment = mtf.get("mtf_alignment")
@@ -386,37 +450,47 @@ def _to_decision(
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
+def _tp_clear_path(sd: SymbolCrewData, direction: str) -> float | None:
+    """Fracción del camino entrada→TP libre de niveles fuertes de volumen.
+
+    None si no hay volume profile: en ese caso el factor no puntúa, ni a favor
+    ni en contra.
+    """
+    levels = strong_levels(sd.vp)
+    if not levels:
+        return None
+
+    plan = _strategy_levels(sd)["long" if direction == "LONG" else "short"]
+    box_range = float(sd.caja.high) - float(sd.caja.low)
+    return clear_path_fraction(
+        plan["entry"], plan["take_profit"], dedupe_levels(levels, box_range)
+    )
+
+
 def _confluence_from_sd(
     sd: SymbolCrewData, direction: str, settings: Any, mtf: dict | None = None
 ) -> dict:
-    """Confluence determinista (dict con score/recommendation/factors) desde sd.
+    """Score determinista de calidad del setup (score/recommendation/factors).
 
-    Deriva los inputs de sd (RSI, POC vs mid de la caja, breakout) + el MTF real.
-    ``mtf`` se puede pasar ya descargado para NO volver a llamar a Capital; la
-    alineación se recalcula desde sus sesgos para la ``direction`` pedida.
+    Ya NO mide la fuerza de la ruptura: cuánto penetró el cierre fuera de la
+    caja no puntúa (ver domain/signals/confluence.py). Lo que puntúa es el
+    contexto en el que se opera esa ruptura — tendencia de 4h, obstáculos de
+    volumen entre la entrada y el TP, y divergencia precio/RSI.
     """
-    rsi_value = sd.rsi.get("last") if isinstance(sd.rsi, dict) else None
-    poc = sd.vp.get("poc") if isinstance(sd.vp, dict) else None
-    # Sin POC no se puede verificar la alineación → tratar como NO alineado.
-    poc_above_mid = (direction != "LONG") if poc is None else (poc > sd.caja.mid)
-
     state = (sd.breakout_signal.state or "").upper()
     breakout_aligned = (state == "ABOVE" and direction == "LONG") or (
         state == "BELOW" and direction == "SHORT"
     )
-
-    if mtf is None:
-        mtf = analyze_multi_timeframe(sd.symbol, direction)
-    biases = mtf.get("tf_biases") or {}
-    alignment = mtf_alignment(biases, direction) if biases else mtf.get("mtf_alignment", "MIXED")
-    mtf_aligned = alignment == "ALIGNED"
+    mtf = mtf or {}
+    rsi = sd.rsi if isinstance(sd.rsi, dict) else {}
 
     return compute_confluence_score(
         direction=direction,
-        rsi_value=rsi_value,
-        poc_above_mid=poc_above_mid,
         breakout_aligned=breakout_aligned,
-        mtf_aligned=mtf_aligned,
+        htf_bias=mtf.get("htf_bias"),
+        mtf_alignment=mtf.get("mtf_alignment"),
+        clear_path_fraction=_tp_clear_path(sd, direction),
+        rsi_divergence=rsi.get("divergence"),
         proceed_threshold=settings.effective_min_confluence,
     )
 
@@ -424,7 +498,7 @@ def _confluence_from_sd(
 def _authoritative_confluence(
     sd: SymbolCrewData, direction: str, settings: Any, mtf: dict | None = None
 ) -> int:
-    """Score de confluencia autoritativo (int) para la dirección dada."""
+    """Score autoritativo (int) del setup para la dirección dada."""
     return int(_confluence_from_sd(sd, direction, settings, mtf)["score"])
 
 

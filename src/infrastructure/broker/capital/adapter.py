@@ -65,6 +65,12 @@ def _fetch_prices(
     headers = {"X-SECURITY-TOKEN": xst, "CST": cst}
     params = {"resolution": resolution, "max": max_n, "from": from_iso, "to": to_iso}
     resp = requests.get(url, params=params, headers=headers, timeout=20)
+    if resp.status_code == 404:
+        # Capital responde 404 a un rango sin precios (fin de semana, festivo).
+        # Al descargar por chunks, uno de ellos cae ahí con frecuencia: lanzar
+        # tumbaba la descarga entera y dejaba el sesgo 4h siempre "NEUTRAL".
+        log.debug("Capital: sin precios %s %s [%s, %s]", symbol, resolution, from_iso, to_iso)
+        return []
     resp.raise_for_status()
     return resp.json().get("prices", [])
 

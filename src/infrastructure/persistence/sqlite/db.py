@@ -25,7 +25,7 @@ _INITIALIZED: set[str] = set()  # paths ya inicializados
 
 # Versión actual del schema. schema.sql refleja SIEMPRE el estado final;
 # las DBs existentes se llevan a ese estado aplicando _MIGRATIONS en orden.
-LATEST_SCHEMA_VERSION = 3
+LATEST_SCHEMA_VERSION = 5
 
 _MIGRATIONS: dict[int, str] = {
     1: """
@@ -57,6 +57,37 @@ _MIGRATIONS: dict[int, str] = {
     """,
     3: """
     ALTER TABLE trades ADD COLUMN max_favorable_price REAL;
+    """,
+    # Toda decisión se registra, se ejecute o no: sin las descartadas no hay
+    # forma de medir si el filtro mejora (la mitad de la muestra son las que
+    # NO se operaron). execution_status distingue una decisión ejecutada de
+    # una frenada, y por qué.
+    4: """
+    ALTER TABLE decisions ADD COLUMN execution_status TEXT;
+    UPDATE decisions SET execution_status = 'EXECUTED' WHERE execution_status IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_decisions_execution_status
+      ON decisions(execution_status);
+    """,
+    # Memoria de rupturas ya analizadas. detect_breakout devuelve SIEMPRE el
+    # primer cierre fuera de la caja: sin esta marca el símbolo ya decidido se
+    # re-analiza en cada vela hasta que la señal caduca por edad.
+    5: """
+    CREATE TABLE IF NOT EXISTS analyzed_signals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      symbol TEXT NOT NULL,
+      signal_time TEXT NOT NULL,
+      breakout_state TEXT,
+      outcome TEXT,
+      run_id TEXT NOT NULL,
+      ts TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (run_id) REFERENCES runs(id)
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_analyzed_signals_key
+      ON analyzed_signals(symbol, signal_time);
+
+    CREATE INDEX IF NOT EXISTS idx_analyzed_signals_run_id ON analyzed_signals(run_id);
     """,
 }
 

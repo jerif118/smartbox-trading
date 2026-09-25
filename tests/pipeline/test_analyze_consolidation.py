@@ -27,54 +27,77 @@ from pipeline.stages.s5_analyze import (
 )
 
 
-def _crew_data(state: str, poc: float, rsi: float | None = 50.0) -> SymbolCrewData:
+def _crew_data(
+    state: str,
+    poc: float,
+    rsi: float | None = 50.0,
+    penetration_pct: float = 20.0,
+    rsi_divergence: str | None = None,
+) -> SymbolCrewData:
     return AnalyzeInput(
         symbols=[
             {
                 "symbol": "US500",
-                "breakout_signal": {"state": state, "close": 7488.0},
+                "breakout_signal": {
+                    "state": state,
+                    "close": 7488.0,
+                    "penetration_pct": penetration_pct,
+                },
                 "caja": {"high": 7482.4, "low": 7449.5, "mid": 7465.95, "amp_pct": 0.44},
                 "vp": {"poc": poc},
-                "rsi": {"last": rsi},
+                "rsi": {"last": rsi, "divergence": rsi_divergence},
             }
         ]
     ).symbols[0]
 
 
+def _settings(**over) -> SimpleNamespace:
+    base = {"effective_min_confluence": 55, "min_breakout_penetration_pct": 10.0}
+    return SimpleNamespace(**{**base, **over})
+
+
 def test_authoritative_confluence_ignores_llm_and_uses_real_data() -> None:
-    """A: el score se deriva de los datos reales, no del número del LLM.
+    """El score se deriva de los datos reales, no del número del LLM.
 
-    Datos favorables a LONG (breakout ABOVE, POC sobre el mid, MTF ALIGNED) →
-    score alto calculado en Python, con independencia de lo que reportara el LLM.
+    Contexto favorable (4h a favor) → score por encima del umbral, calculado en
+    Python, con independencia de lo que reportara el LLM.
     """
-    settings = SimpleNamespace(effective_min_confluence=55)
-    sd = _crew_data(state="ABOVE", poc=7470.0)  # poc > mid(7465.95)
-    with patch("pipeline.stages.s5_analyze.analyze_multi_timeframe",
-               return_value={"mtf_alignment": "ALIGNED"}):
-        score = _authoritative_confluence(sd, "LONG", settings)
-    # RSI neutral(20)+POC(25)+breakout(30)+MTF(25) = 100
-    assert score == 100
-
-
-def test_authoritative_confluence_reuses_precomputed_mtf(monkeypatch) -> None:
-    """B: si se pasa el mtf ya descargado, NO se vuelve a llamar a Capital."""
-    import pipeline.stages.s5_analyze as s5
-
-    calls = {"n": 0}
-
-    def _fake_mtf(*_a, **_k):
-        calls["n"] += 1
-        return {"mtf_alignment": "ALIGNED", "tf_biases": {}}
-
-    monkeypatch.setattr(s5, "analyze_multi_timeframe", _fake_mtf)
     sd = _crew_data(state="ABOVE", poc=7470.0)
-    settings = SimpleNamespace(effective_min_confluence=55)
-    precomputed = {
-        "mtf_alignment": "ALIGNED",
-        "tf_biases": {"15min": "BULLISH", "1h": "BULLISH", "4h": "NEUTRAL"},
-    }
-    s5._authoritative_confluence(sd, "LONG", settings, mtf=precomputed)
-    assert calls["n"] == 0
+    mtf = {"htf_bias": "BULLISH", "mtf_alignment": "ALIGNED"}
+    settings = _settings()
+
+    score = _authoritative_confluence(sd, "LONG", settings, mtf)
+
+    assert score > settings.effective_min_confluence
+
+
+def test_authoritative_confluence_depends_on_the_4h_trend() -> None:
+    """La tendencia de 4h es el factor principal: cambiarla cambia el veredicto."""
+    sd = _crew_data(state="ABOVE", poc=7470.0)
+    settings = _settings()
+
+    a_favor = _authoritative_confluence(
+        sd, "LONG", settings, {"htf_bias": "BULLISH", "mtf_alignment": "ALIGNED"}
+    )
+    en_contra = _authoritative_confluence(
+        sd, "LONG", settings, {"htf_bias": "BEARISH", "mtf_alignment": "COUNTER"}
+    )
+
+    assert a_favor > settings.effective_min_confluence
+    assert en_contra < settings.effective_min_confluence
+
+
+def test_authoritative_confluence_no_longer_depends_on_penetration() -> None:
+    """La penetración de la caja dejó de mover el score."""
+    settings = _settings()
+    mtf = {"htf_bias": "BULLISH", "mtf_alignment": "ALIGNED"}
+
+    marginal = _crew_data(state="ABOVE", poc=7470.0, penetration_pct=0.6)
+    decidida = _crew_data(state="ABOVE", poc=7470.0, penetration_pct=25.0)
+
+    assert _authoritative_confluence(marginal, "LONG", settings, mtf) == (
+        _authoritative_confluence(decidida, "LONG", settings, mtf)
+    )
 
 
 def test_branch_normalizes_deterministic_fields(monkeypatch) -> None:
@@ -85,9 +108,9 @@ def test_branch_normalizes_deterministic_fields(monkeypatch) -> None:
     """
     import pipeline.stages.s5_analyze as s5
 
-    sd = _crew_data(state="ABOVE", poc=7470.0)  # breakout real ABOVE, poc > mid
-    settings = SimpleNamespace(
-        effective_min_confluence=55,
+    # breakout real ABOVE, ruptura decidida (25% del rango)
+    sd = _crew_data(state="ABOVE", poc=7470.0, penetration_pct=25.0)
+    settings = _settings(
         min_rr_ratio=1.0,
         max_daily_loss=500.0,
         llm=SimpleNamespace(trader="openai/x", risk_analyst="openai/x"),
@@ -126,21 +149,65 @@ def test_branch_normalizes_deterministic_fields(monkeypatch) -> None:
     res = s5._analyze_symbol_branch(sd, settings, "run-x")
     # breakout_state normalizado al REAL (ABOVE), no al alucinado (BELOW)
     assert res.trader.breakout_state == "ABOVE"
-    # score determinista: RSI neutral(20)+POC(25)+breakout(30)+MTF(25) = 100 (no 99)
-    assert res.trader.confluence_score == 100
+    # score determinista desde el contexto real (4h alcista, marcos alineados),
+    # no el 99 que devolvió el LLM
+    assert res.trader.confluence_score != 99
+    assert res.trader.confluence_score >= settings.effective_min_confluence
 
 
 def test_authoritative_confluence_low_when_data_contradicts() -> None:
-    """A: datos que NO apoyan la dirección → score bajo, aunque el LLM dijera 100."""
-    settings = SimpleNamespace(effective_min_confluence=55)
-    # breakout BELOW mientras la dirección es LONG, POC bajo el mid, MTF no alineado
-    sd = _crew_data(state="BELOW", poc=7460.0)  # poc < mid
-    with patch("pipeline.stages.s5_analyze.analyze_multi_timeframe",
-               return_value={"mtf_alignment": "MIXED"}):
-        score = _authoritative_confluence(sd, "LONG", settings)
-    # RSI neutral(20)+POC contrario(10) = 30 → por debajo del umbral
-    assert score == 30
+    """Datos que NO apoyan la dirección → score 0, aunque el LLM dijera 100."""
+    settings = _settings()
+    # breakout BELOW mientras la dirección propuesta es LONG
+    sd = _crew_data(state="BELOW", poc=7460.0, penetration_pct=25.0)
+    score = _authoritative_confluence(sd, "LONG", settings)
+    assert score == 0
     assert score < settings.effective_min_confluence
+
+
+def test_authoritative_confluence_rejects_trade_against_the_4h() -> None:
+    """Operar contra la tendencia de 4h queda por debajo del umbral."""
+    settings = _settings()
+    sd = _crew_data(state="BELOW", poc=7460.0)
+
+    score = _authoritative_confluence(
+        sd, "SHORT", settings, {"htf_bias": "BULLISH", "mtf_alignment": "COUNTER"}
+    )
+
+    assert score < settings.effective_min_confluence
+
+
+def test_authoritative_confluence_accepts_trade_with_the_4h() -> None:
+    """A favor de la tendencia de 4h, la ruptura es operable."""
+    settings = _settings()
+    sd = _crew_data(state="ABOVE", poc=7460.0)
+
+    score = _authoritative_confluence(
+        sd, "LONG", settings, {"htf_bias": "BULLISH", "mtf_alignment": "ALIGNED"}
+    )
+
+    assert score >= settings.effective_min_confluence
+
+
+def test_divergence_against_the_trade_downgrades_but_does_not_veto() -> None:
+    """Con el 4h a favor y camino limpio, una divergencia rebaja pero no veta.
+
+    Es deliberado: las divergencias fallan a menudo dentro de una tendencia
+    fuerte. Baja del umbral de riesgo completo (70) —el trade entra a medio
+    tamaño— pero no cae por debajo del mínimo para operar. Sola, sin el resto
+    de factores a favor, sí tumba el setup (ver tests de confluence).
+    """
+    settings = _settings()
+    mtf = {"htf_bias": "BULLISH", "mtf_alignment": "ALIGNED"}
+    limpio = _crew_data(state="ABOVE", poc=7460.0)
+    con_divergencia = _crew_data(state="ABOVE", poc=7460.0, rsi_divergence="BEARISH")
+
+    score_limpio = _authoritative_confluence(limpio, "LONG", settings, mtf)
+    score_div = _authoritative_confluence(con_divergencia, "LONG", settings, mtf)
+
+    assert score_div < score_limpio
+    assert score_div < 70  # deja de ser riesgo completo
+    assert score_div >= settings.effective_min_confluence
 
 
 def _result(
@@ -299,3 +366,67 @@ def test_strategy_levels_use_box_for_stop_loss_and_rr() -> None:
     assert levels["short"]["stop_loss"] == 7482.4
     assert levels["short"]["take_profit"] == 7416.6
     assert levels["short"]["rr_ratio"] == 1.0
+
+
+@pytest.mark.parametrize("bad_state", ["INSIDE", "NONE"])
+def test_branch_without_breakout_does_not_invent_a_direction(monkeypatch, bad_state) -> None:
+    """Sin breakout operable la rama corta: nada de asumir LONG.
+
+    Antes, `candidate` caía a "LONG" por defecto y se arrancaba la rama entera
+    (descarga MTF + 2 llamadas al LLM) analizando una dirección inventada.
+    """
+    import pipeline.stages.s5_analyze as s5
+
+    sd = _crew_data(state=bad_state, poc=7470.0)
+    settings = SimpleNamespace(
+        effective_min_confluence=55,
+        min_rr_ratio=1.0,
+        max_daily_loss=500.0,
+        llm=SimpleNamespace(trader="openai/x", risk_analyst="openai/x"),
+    )
+
+    called: list[str] = []
+    monkeypatch.setattr(s5, "bind_log_context", lambda **k: None)
+    monkeypatch.setattr(
+        s5, "analyze_multi_timeframe", lambda *a, **k: called.append("mtf") or {}
+    )
+    monkeypatch.setattr(
+        s5, "build_trader_agent", lambda *a, **k: called.append("trader") or object()
+    )
+    monkeypatch.setattr(
+        s5, "build_risk_agent", lambda *a, **k: called.append("risk") or object()
+    )
+    monkeypatch.setattr(s5, "Crew", lambda **k: called.append("crew") or SimpleNamespace())
+
+    res = s5._analyze_symbol_branch(sd, settings, "run-x")
+
+    assert res.trader.proposed_direction == "NO_OPERAR"
+    assert res.risk.risk_decision == "NEED_DATA"
+    assert res.trader.confluence_score == 0
+    # Ni red ni tokens gastados en una dirección que no existe.
+    assert called == []
+
+
+def test_llm_failure_is_reported_as_failed_symbol_not_a_decision(monkeypatch) -> None:
+    """Si la rama revienta (LLM/API caído) el NO_OPERAR resultante no es una
+    decisión de estrategia: el símbolo sale en `failed_symbols` para que el
+    orquestador no marque la ruptura como decidida y la reintente."""
+    import pipeline.stages.s5_analyze as s5
+
+    sd = _crew_data(state="ABOVE", poc=7470.0)
+
+    def boom(*a, **k):
+        raise RuntimeError("400 Function tools with reasoning_effort are not supported")
+
+    monkeypatch.setattr(s5, "_analyze_symbol_branch", boom)
+    monkeypatch.setattr(s5, "event_repo", SimpleNamespace(log_event=lambda **k: None))
+    monkeypatch.setattr(
+        s5,
+        "get_settings",
+        lambda: SimpleNamespace(effective_min_confluence=55, full_risk_confluence=70),
+    )
+
+    out = s5.stage_analyze(AnalyzeInput(symbols=[sd.model_dump()]), "run-x")
+
+    assert out.failed_symbols == ["US500"]
+    assert out.decisions[0].action == Action.NO_OPERAR
